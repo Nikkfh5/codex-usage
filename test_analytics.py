@@ -158,7 +158,7 @@ class APITests(HTTPTestCase):
         second=json.loads(self.get('/api/v1/events'+self.query+'&machine=mac&limit=1&cursor='+first['next_cursor']))
         self.assertIsNone(second['next_cursor'])
         self.assertEqual(sum(e['total_tokens'] for e in first['events']+second['events']),d['totals']['total_tokens'])
-        self.assertEqual(json.loads(self.get('/api/v1/schema'))['schema_version'],'2.1')
+        self.assertEqual(json.loads(self.get('/api/v1/schema'))['schema_version'],'2.2')
     def test_csv_formulas_escaped_and_contract_rejects_bad_params(self):
         e=event(999,machine='=HYPERLINK("bad")');self.http.store.connection.execute('INSERT INTO usage VALUES (?,?,?)',(e['id'],e['timestamp_ms'],json.dumps(e)));self.http.store.connection.commit()
         text=self.get('/api/v1/export.csv'+self.query).decode();self.assertIn("'=HYPERLINK",text)

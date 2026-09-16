@@ -6,22 +6,22 @@
 **Architecture:** JSONL -> local SQLite ledger -> acknowledged batches -> existing receiver.
 **Stack:** Python standard library, SQLite, native OS startup, existing JS dashboard.
 
-- [ ] Baseline: exclude private TOML/data, initialize Git on `durable-delivery`, commit current sources.
-- [ ] Client (`codex_usage.py`, `test_codex_usage.py`): canonical response validation, atomic
+- [x] Baseline: exclude private TOML/data, initialize Git on `durable-delivery`, commit current sources.
+- [x] Client (`codex_usage.py`, `test_codex_usage.py`): canonical response validation, atomic
   JSONL cursor + ledger, incomplete-line retry, persistent ACK flags, daily digest reconciliation,
   direct HTTPS independent of inherited proxy, install/run/once/status/doctor commands.
   Start with failing tests; run `python -m unittest -v test_codex_usage.py` after implementation.
-- [ ] Receiver (`server.py`, `test_sync.py`): authenticated `/v1/usage`, ACK after commit,
+- [x] Receiver (`server.py`, `test_sync.py`): authenticated `/v1/usage`, ACK after commit,
   global response ID conflicts, inventory, safe session activation, persistent sync status.
   Start with failing API tests; verify retries, rejection atomicity, DB restart and cross-host conflicts.
-- [ ] Integration (`dashboard.js`, docs): existing machine card shows last reported queue/error/sync age;
+- [x] Integration (`dashboard.js`, docs): existing machine card shows last reported queue/error/sync age;
   expose journal source in API/export. Account with a single source per whole session to avoid
   guessing cross-protocol response identities. Retain original OTLP rows; active journal sessions
   use complete journal history. Existing sessions require explicit adoption and cross-host checks.
-- [ ] Fault checks: real test HTTP server, lost ACK, HTTP 401/429/500, sender/database restart,
+- [x] Fault checks: real test HTTP server, lost ACK, HTTP 401/429/500, sender/database restart,
   restored older server DB, partial JSONL, copied session and secret sentinel.
   Run `python -m unittest -v test_server.py test_analytics.py test_pricing.py test_sync.py test_codex_usage.py`.
-- [ ] Review: spec review, then code quality review; resolve findings and rerun affected checks.
+- [x] Review: spec review, then code quality review; resolve findings and rerun affected checks.
 - [ ] Deployment: backup SQLite, stage immutable release, run Linux tests, update Nginx for
   Bearer-authenticated endpoint, atomic release switch, health + production round-trip.
 - [ ] Onboarding: install on ASUS, verify real responses, reconcile and deliberately adopt verified

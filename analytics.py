@@ -5,12 +5,13 @@ from collections import defaultdict
 from math import fsum
 import pricing
 
-VERSION = "2.1"
+VERSION = "2.2"
 MAX_DAYS = 31
 FILTERS = ("machine", "model", "effort", "tier", "session")
 METRICS = ("total_tokens", "input_tokens", "cached_input_tokens", "uncached_input_tokens", "output_tokens", "reasoning_output_tokens", "visible_output_tokens")
 SEMANTICS = {
-    "total_tokens": "input_tokens + output_tokens; observed response.completed events, not subscription billing",
+    "total_tokens": "input_tokens + output_tokens; journal responses for activated sessions, otherwise OTLP response.completed; not subscription billing",
+    "source": "Whole-session journal authority replaces OTLP in analytics; original OTLP rows retained. Journal IDs deduplicate responses globally. Unactivated journal rows are excluded.",
     "cached_input_tokens": "Subset of input_tokens; counted once in total_tokens",
     "uncached_input_tokens": "input_tokens - cached_input_tokens",
     "reasoning_output_tokens": "Subset of output_tokens; counted once in total_tokens",
@@ -21,9 +22,9 @@ SEMANTICS = {
     "reasoning_output_pct": "100 * reasoning_output_tokens / output_tokens",
     "average_tokens": "total_tokens / response_completed_events; includes zero-output events unless filtered out",
     "unknown": "Missing modes stay unknown. Missing token subsets yield null aggregates, never invented zeroes.",
-    "activity": "Recent receipt of native telemetry, not proof a machine is online or offline; no client heartbeat daemon.",
+    "activity": "Latest native telemetry or journal sync receipt; journal queue/error describes the last client report, not current offline state or proof of completeness.",
     "comparison": "Previous adjacent interval of equal duration, same filters. Coverage describes stored observations, not guaranteed collection completeness.",
-    "effort": "Direct per-response model_reasoning_effort (or reasoning_effort on that same event); never inferred from current config or session startup.",
+    "effort": "Reported on the OTLP event or preceding journal turn_context; never inferred from current config or session startup.",
     "tier": "fast/priority mapped to fast; default/standard mapped to standard; other explicitly reported tiers retained; absent is unknown.",
     "causality": "Differences between sessions/models/modes are descriptive; tasks and context differ. Token totals do not prove cost, quality, or causal savings.",
     "pricing": pricing.CONTRACT,
@@ -48,6 +49,8 @@ def tier_name(value):
 
 def enrich(event):
     e = dict(event)
+    e["source"] = e.get("source", "otlp")
+    e["model"] = e.get("model") or "unknown"
     e["effort"] = label(e.get("effort")) or "unknown"
     e["service_tier"] = label(e.get("service_tier"))
     e["tier"] = tier_name(e["service_tier"])

@@ -47,6 +47,9 @@ function activity(){
     const b=document.createElement('button');b.className='machine-select';
     const total=state.breakdowns.machine.find(row=>row.key===m.machine);
     b.innerHTML=`<span class="machine-name">${esc(m.machine)}</span><span class="machine-signal"><i class="signal-dot ${m.status==='recent'?'recent':''}"></i>${m.status==='recent'?'Телеметрия '+age(m.age_ms):m.status==='quiet'?'Последний сигнал '+age(m.age_ms):'Последнее событие '+date(m.last_event_ms)}</span><span class="machine-cost">${total?`<strong>${cost(total)}</strong> · ${short(total.total_tokens)} токенов`:'Нет событий в выборке'}</span>`;
+    const sync=document.createElement('span');sync.className='machine-signal';
+    sync.textContent=m.journal?`Сверка ${age(m.journal.age_ms)} · очередь в отчёте: ${number(m.journal.pending_events)} · сессий: ${number(m.journal.active_sessions)}${m.journal.mismatched_days?' · есть расхождения':''}${m.journal.last_error?' · '+m.journal.last_error:''}`:'OTLP · очередь и полнота не проверяются';
+    b.append(sync);
     b.title=[m.host,m.client,m.version,'Цена и токены по текущим фильтрам'].filter(Boolean).join(' · ');b.onclick=()=>choose('machine',$('machine').value===m.machine?'':m.machine);
     const remove=document.createElement('button');remove.className='machine-remove';remove.textContent='×';remove.setAttribute('aria-label','Убрать карточку '+m.machine);remove.title='Убрать карточку. История сохранится.';remove.onclick=()=>visibility(m.machine,true,remove);
     card.append(b,remove);$('activity').append(card);

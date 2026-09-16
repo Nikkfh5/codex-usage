@@ -6,6 +6,7 @@ import io
 import hashlib
 import hmac
 import json
+import re
 import sqlite3
 import threading
 import time
@@ -20,6 +21,15 @@ ROOT = Path(__file__).resolve().parent
 LOCK = threading.Lock()
 TOKEN_FIELDS = {"input_tokens": "input_token_count", "output_tokens": "output_token_count", "cached_input_tokens": "cached_token_count", "reasoning_output_tokens": "reasoning_token_count", "cache_write_input_tokens": "cache_write_token_count", "tool_tokens": "tool_token_count"}
 SAFE = set(TOKEN_FIELDS.values()) | {"event.name", "event.kind", "event.timestamp", "env", "host.name", "model", "conversation.id", "service.name", "app.version", "originator", "startup.phase", "model_reasoning_effort", "reasoning_effort", "service_tier"}
+
+class SyncConflict(ValueError):
+    pass
+
+
+def sync_label(value):
+    if not isinstance(value, str) or not 0 < len(value) <= 240 or any(ord(c) < 32 for c in value):
+        raise ValueError("invalid identity")
+    return value
 
 def unpack(value):
     if not isinstance(value, dict):
@@ -89,8 +99,18 @@ class Store:
         self.connection = sqlite3.connect(path, check_same_thread=False)
         self.connection.execute("CREATE TABLE IF NOT EXISTS usage (id TEXT PRIMARY KEY, timestamp_ms INTEGER NOT NULL, body TEXT NOT NULL)")
         self.connection.execute("CREATE INDEX IF NOT EXISTS usage_timestamp ON usage(timestamp_ms)")
+        self.connection.execute("CREATE INDEX IF NOT EXISTS usage_session ON usage(json_extract(body,'$.session'))")
+        self.connection.execute("CREATE INDEX IF NOT EXISTS usage_collector ON usage(json_extract(body,'$.collector_id'))")
         self.connection.execute("CREATE TABLE IF NOT EXISTS machine_activity (machine TEXT PRIMARY KEY, host TEXT, client TEXT, version TEXT, first_event_ms INTEGER, last_event_ms INTEGER, last_received_ms INTEGER)")
         self.connection.execute("CREATE TABLE IF NOT EXISTS machine_preferences (machine TEXT PRIMARY KEY, hidden INTEGER NOT NULL CHECK(hidden IN (0,1)))")
+        self.connection.execute("CREATE TABLE IF NOT EXISTS journal_collectors (collector_id TEXT PRIMARY KEY, machine TEXT NOT NULL, received_ms INTEGER NOT NULL, status TEXT NOT NULL)")
+        self.connection.execute("CREATE TABLE IF NOT EXISTS journal_sessions (session TEXT PRIMARY KEY, machine TEXT NOT NULL, collector_id TEXT NOT NULL)")
+        # Original OTLP rows remain available for audit; choose one source for each whole session.
+        self.connection.execute("""CREATE VIEW IF NOT EXISTS visible_usage AS
+            SELECT u.* FROM usage u LEFT JOIN journal_sessions j
+              ON j.session=json_extract(u.body,'$.session')
+            WHERE (json_extract(u.body,'$.source')='journal' AND j.collector_id=json_extract(u.body,'$.collector_id') AND j.machine=json_extract(u.body,'$.machine'))
+               OR (COALESCE(json_extract(u.body,'$.source'),'otlp')!='journal' AND j.session IS NULL)""")
         # Legacy usage remains untouched. Its event timestamp is not a receipt timestamp.
         self.connection.execute("""INSERT OR IGNORE INTO machine_activity
             SELECT json_extract(body, '$.machine'), MAX(json_extract(body, '$.host')),
@@ -138,22 +158,109 @@ class Store:
             self.connection.commit()
         return added
 
+    def sync(self, payload):
+        from codex_usage import canonical_event, day_inventory, event_digest
+        if not isinstance(payload, dict) or type(payload.get("version")) is not int or payload["version"] != 1:
+            raise ValueError("unsupported protocol")
+        machine, collector = sync_label(payload.get("machine")), sync_label(payload.get("collector_id"))
+        action = payload.get("action")
+        now = int(time.time() * 1000)
+        result = {"version": 1}
+        with LOCK, self.connection:
+            owner = self.connection.execute("SELECT machine FROM journal_collectors WHERE collector_id=?", (collector,)).fetchone()
+            if owner and owner[0] != machine:
+                raise SyncConflict("collector identity conflict")
+            self.connection.execute("INSERT INTO journal_collectors VALUES (?,?,?,?) ON CONFLICT(collector_id) DO UPDATE SET received_ms=excluded.received_ms", (collector, machine, now, '{}'))
+            if action == "events":
+                events = payload.get("events")
+                if not isinstance(events, list) or not 1 <= len(events) <= 200:
+                    raise ValueError("invalid batch size")
+                accepted = []
+                for raw in events:
+                    item = canonical_event(raw)
+                    if item["machine"] != machine or item["collector_id"] != collector:
+                        raise SyncConflict("event identity conflict")
+                    active = self.connection.execute("SELECT collector_id FROM journal_sessions WHERE session=?", (item["session"],)).fetchone()
+                    if active and active[0] != collector:
+                        raise SyncConflict("session ownership conflict")
+                    previous = self.connection.execute("SELECT body FROM usage WHERE id=?", (item["id"],)).fetchone()
+                    if previous and event_digest(json.loads(previous[0])) != event_digest(item):
+                        raise SyncConflict("response identity conflict")
+                    self.connection.execute("INSERT OR IGNORE INTO usage VALUES (?,?,?)", (item["id"], item["timestamp_ms"], json.dumps(item)))
+                    accepted.append(item["response_id"])
+                result["accepted"] = accepted
+            elif action == "inventory":
+                days, status = payload.get("days"), payload.get("status")
+                if not isinstance(days, list) or len(days) > 4000 or not isinstance(status, dict):
+                    raise ValueError("invalid inventory")
+                reported = {}
+                for day in days:
+                    if not isinstance(day, dict) or not isinstance(day.get("day"), str):
+                        raise ValueError("invalid day")
+                    if datetime.strptime(day["day"], "%Y-%m-%d").strftime("%Y-%m-%d") != day["day"]:
+                        raise ValueError("invalid day")
+                    if day["day"] in reported or type(day.get("count")) is not int or not 0 <= day["count"] <= 2**53-1 or not re.fullmatch(r"[0-9a-f]{64}", str(day.get("digest", ""))):
+                        raise ValueError("invalid digest")
+                    reported[day["day"]] = {key: day[key] for key in ("day", "count", "digest")}
+                clean_status = {}
+                for field in ("scanned_at_ms", "pending_events", "pending_tokens"):
+                    value = status.get(field)
+                    if type(value) is not int or not 0 <= value <= 2**53-1:
+                        raise ValueError("invalid status")
+                    clean_status[field] = value
+                error = status.get("last_error")
+                if error is not None and (not isinstance(error, str) or not re.fullmatch(r"[A-Za-z0-9_:-]{1,80}", error)):
+                    raise ValueError("invalid error code")
+                clean_status["last_error"] = error
+                stored = [json.loads(row[0]) for row in self.connection.execute("SELECT body FROM usage WHERE json_extract(body,'$.collector_id')=? AND json_extract(body,'$.source')='journal'", (collector,))]
+                inventory = {day["day"]: day for day in day_inventory(stored)}
+                result["resend_days"] = sorted(day for day in reported if reported[day] != inventory.get(day))
+                # Missing client history is a visible disagreement, not proof of completeness.
+                result["server_only_days"] = sorted(set(inventory) - set(reported))
+                clean_status["mismatched_days"] = len(result["resend_days"]) + len(result["server_only_days"])
+                clean_status["reported_at_ms"] = now
+                self.connection.execute("UPDATE journal_collectors SET status=? WHERE collector_id=?", (json.dumps(clean_status), collector))
+            elif action == "activate":
+                sessions = payload.get("sessions")
+                if not isinstance(sessions, list) or not 1 <= len(sessions) <= 200:
+                    raise ValueError("invalid sessions")
+                for session in sessions:
+                    sync_label(session)
+                    rows = [json.loads(row[0]) for row in self.connection.execute("SELECT body FROM usage WHERE json_extract(body,'$.session')=?", (session,))]
+                    own = [row for row in rows if row.get("source") == "journal" and row.get("collector_id") == collector]
+                    if not own:
+                        raise ValueError("session has no journal records")
+                    if any(row["machine"] != machine or (row.get("source") == "journal" and row.get("collector_id") != collector) for row in rows):
+                        raise SyncConflict("session history conflict")
+                    previous = self.connection.execute("SELECT collector_id FROM journal_sessions WHERE session=?", (session,)).fetchone()
+                    if previous and previous[0] != collector:
+                        raise SyncConflict("session ownership conflict")
+                    self.connection.execute("INSERT OR IGNORE INTO journal_sessions VALUES (?,?,?)", (session, machine, collector))
+                result["activated"] = sessions
+            else:
+                raise ValueError("unknown action")
+            result["active_sessions"] = [row[0] for row in self.connection.execute("SELECT session FROM journal_sessions WHERE collector_id=? ORDER BY session", (collector,))]
+            self.connection.execute("""INSERT INTO machine_activity VALUES (?,?,?,?,NULL,NULL,?)
+                ON CONFLICT(machine) DO UPDATE SET last_received_ms=excluded.last_received_ms""", (machine, machine, "codex_journal", None, now))
+        # The connection context has committed before ACK reaches the HTTP handler.
+        return result
+
     def snapshot(self, hours=None):
         with LOCK:
             if hours is None:
-                query = self.connection.execute("SELECT body FROM usage ORDER BY timestamp_ms")
+                query = self.connection.execute("SELECT body FROM visible_usage ORDER BY timestamp_ms")
             else:
-                query = self.connection.execute("SELECT body FROM usage WHERE timestamp_ms >= ? ORDER BY timestamp_ms", (int((time.time()-hours*3600)*1000),))
+                query = self.connection.execute("SELECT body FROM visible_usage WHERE timestamp_ms >= ? ORDER BY timestamp_ms", (int((time.time()-hours*3600)*1000),))
             events = [json.loads(row[0]) for row in query]
             return {"events": events, "diagnostics": json.loads(json.dumps(self.diagnostics)), "now_ms": int(time.time() * 1000)}
 
 
     def read_interval(self, start, end):
         with LOCK:
-            events = [json.loads(row[0]) for row in self.connection.execute("SELECT body FROM usage WHERE timestamp_ms >= ? AND timestamp_ms < ? ORDER BY timestamp_ms,id", (max(0, start), end))]
+            events = [json.loads(row[0]) for row in self.connection.execute("SELECT body FROM visible_usage WHERE timestamp_ms >= ? AND timestamp_ms < ? ORDER BY timestamp_ms,id", (max(0, start), end))]
             # GPT-5.5's documented long-context rate applies to its full session,
             # including when the long request falls outside the selected interval.
-            long_sessions = set(self.connection.execute("""SELECT DISTINCT json_extract(body,'$.machine'), json_extract(body,'$.session') FROM usage
+            long_sessions = set(self.connection.execute("""SELECT DISTINCT json_extract(body,'$.machine'), json_extract(body,'$.session') FROM visible_usage
                 WHERE json_extract(body,'$.model') IN ('gpt-5.5','gpt-5.5-2026-04-23') AND json_extract(body,'$.input_tokens') > 272000"""))
         for event in events:
             if (event["machine"], event["session"]) in long_sessions:
@@ -171,10 +278,24 @@ class Store:
         with LOCK:
             rows = self.connection.execute("SELECT * FROM machine_activity ORDER BY machine").fetchall()
             hidden = {row[0] for row in self.connection.execute("SELECT machine FROM machine_preferences WHERE hidden=1")}
+            collectors = self.connection.execute("SELECT collector_id,machine,received_ms,status FROM journal_collectors ORDER BY received_ms").fetchall()
+            active_counts = dict(self.connection.execute("SELECT collector_id,COUNT(*) FROM journal_sessions GROUP BY collector_id"))
+        journal = {}
+        for collector, machine, received, status in collectors:
+            report = json.loads(status)
+            item = journal.setdefault(machine, {"collectors": 0, "age_ms": 0, "pending_events": 0, "pending_tokens": 0, "active_sessions": 0, "mismatched_days": 0, "last_error": None})
+            item["collectors"] += 1
+            # A fresh sender must not hide another CODEX_HOME's stale report or queue.
+            item["age_ms"] = max(item["age_ms"], now_ms-report.get("reported_at_ms", received))
+            for field in ("pending_events", "pending_tokens", "mismatched_days"):
+                item[field] += report.get(field, 0)
+            item["active_sessions"] += active_counts.get(collector, 0)
+            item["last_error"] = report.get("last_error") or item["last_error"]
         result = []
         for row in rows:
             item = dict(zip(("machine", "host", "client", "version", "first_event_ms", "last_event_ms", "last_received_ms"), row))
             item["hidden"] = item["machine"] in hidden
+            item["journal"] = journal.get(item["machine"])
             received = item["last_received_ms"]
             item["age_ms"] = max(0, now_ms - received) if received is not None else None
             item["status"] = "recent" if received is not None and now_ms - received <= 120000 else "quiet" if received is not None else "historical"
@@ -186,7 +307,7 @@ class Store:
         start, end, filters = analytics.parse_query(params, now)
         events = self.read_interval(start - (end - start), end)
         with LOCK:
-            first = self.connection.execute("SELECT MIN(timestamp_ms) FROM usage").fetchone()[0]
+            first = self.connection.execute("SELECT MIN(timestamp_ms) FROM visible_usage").fetchone()[0]
         return analytics.report(events, start, end, filters, now, first, self.activity(now))
 
 class Handler(BaseHTTPRequestHandler):
@@ -232,7 +353,7 @@ class Handler(BaseHTTPRequestHandler):
             return self.respond(200, b'{"ok":true}')
         if self.headers.get("Origin"):
             return self.respond(403, b'{}')
-        if self.path != "/v1/logs":
+        if self.path not in ("/v1/logs", "/v1/usage"):
             return self.respond(404, b'{}')
         token = getattr(self.server, "ingest_token", None)
         if token and not hmac.compare_digest(self.headers.get("Authorization", "").encode(), ("Bearer " + token).encode()):
@@ -244,12 +365,20 @@ class Handler(BaseHTTPRequestHandler):
             if size <= 0 or size > 8 * 1024 * 1024:
                 return self.respond(413, b'{}')
             payload = json.loads(self.rfile.read(size))
-            if not isinstance(payload, dict) or not isinstance(payload.get("resourceLogs"), list):
+            if self.path == "/v1/usage":
+                result = self.server.store.sync(payload)
+            elif not isinstance(payload, dict) or not isinstance(payload.get("resourceLogs"), list):
                 return self.respond(400, b'{}')
-            self.server.store.ingest(payload)
+            else:
+                self.server.store.ingest(payload)
+                result = {}
+        except SyncConflict as error:
+            return self.respond(409, json.dumps({"error": str(error)}).encode())
         except (ValueError, TypeError, KeyError, AttributeError):
             return self.respond(400, b'{}')
-        self.respond(200, b'{}')
+        except sqlite3.Error:
+            return self.respond(503, b'{"error":"storage unavailable"}')
+        self.respond(200, json.dumps(result).encode())
 
     def do_GET(self):
         if not self.valid_host():
@@ -285,7 +414,7 @@ class Handler(BaseHTTPRequestHandler):
                 if path.endswith(".csv"):
                     if "cursor" in params or "limit" in params:
                         raise ValueError("pagination applies to events only")
-                    columns = ["id", "timestamp_ms", "machine", "model", "session", "effort", "service_tier", "tier", *analytics.METRICS, "cache_write_input_tokens", *pricing.FIELDS, "api_price_tier", "api_price_assumed_tier", "api_price_context", "api_price_reason"]
+                    columns = ["id", "source", "response_id", "timestamp_ms", "machine", "model", "session", "effort", "service_tier", "tier", *analytics.METRICS, "cache_write_input_tokens", *pricing.FIELDS, "api_price_tier", "api_price_assumed_tier", "api_price_context", "api_price_reason"]
                     output = io.StringIO()
                     writer = csv.DictWriter(output, fieldnames=columns, extrasaction="ignore")
                     writer.writeheader()
@@ -324,7 +453,7 @@ class Handler(BaseHTTPRequestHandler):
             return self.respond(204, b'')
         if path == "/":
             return self.respond(200, (ROOT / "index.html").read_bytes(), "text/html")
-        assets = {"/dashboard.js": "text/javascript", "/styles.css": "text/css", "/agent-guide.md": "text/markdown"}
+        assets = {"/dashboard.js": "text/javascript", "/styles.css": "text/css", "/agent-guide.md": "text/markdown", "/codex_usage.py": "text/x-python", "/README.md": "text/markdown"}
         if path in assets:
             return self.respond(200, (ROOT / path.lstrip("/")).read_bytes(), assets[path])
         self.respond(404, b'{}')

@@ -55,7 +55,7 @@
   </section>
 
   <section class="panel"><div class="panel-head"><div><h2>Сессии с наибольшим расходом</h2><p id="session-count" class="micro">Откройте сессию для подробностей.</p></div><button id="csv-download" class="button secondary">Скачать CSV <span aria-hidden="true">↓</span></button></div><div class="table-wrap"><table><thead><tr><th>Сессия / машина</th><th>Модель и режим</th><th class="num">Все токены</th><th class="num">Оценка API</th><th class="num">Без кэша · вход</th><th class="num">Кэш / все</th><th class="num">Reasoning / выход</th><th class="num">Запросы</th></tr></thead><tbody id="sessions"></tbody></table></div><p id="sessions-empty" class="empty" hidden>Сессий в этой выборке пока нет.</p></section>
-  <footer><span>Сумма событий Codex. Кэш входит во входные токены, reasoning — в выходные. Это не счёт за подписку и не оценка качества работы.</span><span id="data-start"></span></footer>
+  <footer><span>Сумма событий Codex. Кэш входит во входные токены, reasoning — в выходные. Это не счёт за подписку и не оценка качества работы.</span><span id="data-start"></span><span><a href="/codex_usage.py" download>Скачать отправитель Python</a> · <a href="/README.md" target="_blank" rel="noopener">Подключить машину</a></span></footer>
 </main>
 
 <dialog id="session-dialog" class="detail-dialog"><div class="dialog-head"><div><div class="eyebrow">СЕССИЯ</div><h2 id="detail-title"></h2><p id="detail-subtitle" class="micro"></p></div><button data-close="session-dialog" class="icon-button" aria-label="Закрыть">×</button></div><div id="session-detail"></div></dialog>

@@ -2,13 +2,13 @@
 
 - Начать с `README.md`: быстрый вход, текущие результаты проверки и восстановление.
   Контракт GET API и определения метрик — в `agent-guide.md`.
-- Локальные исходники: `C:\N\hse\codex-usage-lab`; каталога `.git` нет.
+- Локальные исходники: `C:\N\hse\codex-usage-lab`; Git-ветка `durable-delivery`.
   Production: `ssh aeza`, `/opt/codex-usage/current` (ссылка на выпуск).
   База: `/var/lib/codex-usage/usage.sqlite`; сервис: `codex-usage.service`.
-- `server.py` принимает OTLP и хранит события; `analytics.py` считает показатели;
+- `codex_usage.py` доставляет JSONL через локальную очередь; `server.py` принимает OTLP/журнал; `analytics.py` считает показатели;
   `pricing.py` оценивает API-эквивалент; `dashboard.js` управляет интерфейсом.
-- Из каталога проекта: `python -m unittest -v test_server.py test_analytics.py test_pricing.py`.
-  На Linux — `python3`; Python 3.10+. Windows требуется доступная IANA-база tzdata.
+- Из каталога проекта: `python -m unittest -v test_server test_analytics test_pricing test_sync test_codex_usage`.
+  На Linux — `python3`; сервер Python 3.10+, клиент 3.11+. Windows требуется доступная IANA-база tzdata.
 - Не редактировать выпущенные файлы в `releases/` на месте. Проверить локальный diff,
   SHA-256, тесты и резервную копию данных перед новым выпуском.
   Эксплуатационные документы на сервере находятся в `/opt/codex-usage/`.
