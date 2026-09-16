@@ -22,9 +22,9 @@
   restored older server DB, partial JSONL, copied session and secret sentinel.
   Run `python -m unittest -v test_server.py test_analytics.py test_pricing.py test_sync.py test_codex_usage.py`.
 - [x] Review: spec review, then code quality review; resolve findings and rerun affected checks.
-- [ ] Deployment: backup SQLite, stage immutable release, run Linux tests, update Nginx for
+- [x] Deployment: backup SQLite, stage immutable release, run Linux tests, update Nginx for
   Bearer-authenticated endpoint, atomic release switch, health + production round-trip.
-- [ ] Onboarding: install on ASUS, verify real responses, reconcile and deliberately adopt verified
+- [x] Onboarding: install on ASUS, verify real responses, reconcile and deliberately adopt verified
   existing Windows sessions. Publish private Git repo and provide portable one-command instructions.
   Other machines count as installed only after an actual run there; no SSH access is currently supplied.
 
