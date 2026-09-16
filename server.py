@@ -286,9 +286,9 @@ class Store:
             item = journal.setdefault(machine, {"collectors": 0, "age_ms": 0, "pending_events": 0, "pending_tokens": 0, "active_sessions": 0, "mismatched_days": 0, "last_error": None})
             item["collectors"] += 1
             # A fresh sender must not hide another CODEX_HOME's stale report or queue.
-            item["age_ms"] = max(item["age_ms"], now_ms-report.get("reported_at_ms", received))
+            item["age_ms"] = max(item["age_ms"], now_ms-report["reported_at_ms"]) if item["age_ms"] is not None and "reported_at_ms" in report else None
             for field in ("pending_events", "pending_tokens", "mismatched_days"):
-                item[field] += report.get(field, 0)
+                item[field] = item[field] + report[field] if item[field] is not None and field in report else None
             item["active_sessions"] += active_counts.get(collector, 0)
             item["last_error"] = report.get("last_error") or item["last_error"]
         result = []

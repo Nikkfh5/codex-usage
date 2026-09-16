@@ -109,6 +109,12 @@ class SyncTests(unittest.TestCase):
         self.store.sync(message("events", events=[{**event(), "prompt": "PRIVATE_SENTINEL"}]))
         self.assertNotIn("PRIVATE_SENTINEL", str(self.store.connection.execute("SELECT body FROM usage").fetchall()))
 
+    def test_first_upload_is_not_reported_as_an_empty_verified_queue(self):
+        self.store.sync(message("events", events=[event()]))
+        journal = self.store.activity()[0]["journal"]
+        self.assertIsNone(journal["pending_events"])
+        self.assertIsNone(journal["age_ms"])
+
     def test_failed_activation_rolls_back_all_sessions(self):
         other = {**event("resp-other"), "session": "other-session"}
         self.store.sync(message("events", events=[event(), other]))

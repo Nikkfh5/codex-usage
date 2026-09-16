@@ -369,7 +369,7 @@ class Collector:
             with self.db:
                 self.db.executemany("UPDATE events SET acked=1 WHERE response_id=?", [(v,) for v in accepted])
 
-    def _inventory(self):
+    def _inventory(self, mark_resend=True):
         days = day_inventory(json.loads(r[0]) for r in self.db.execute("SELECT data FROM events"))
         current = self.status()
         result = self._post("inventory", days=days, status={k: current[k] for k in ("scanned_at_ms", "pending_events", "pending_tokens", "last_error")})
@@ -379,8 +379,9 @@ class Collector:
         valid = {d["day"] for d in days}
         if not isinstance(resend, list) or any(not isinstance(d, str) or d not in valid for d in resend):
             raise DeliveryError("invalid_inventory")
-        with self.db:
-            self.db.executemany("UPDATE events SET acked=0 WHERE day=?", [(d,) for d in resend])
+        if mark_resend:
+            with self.db:
+                self.db.executemany("UPDATE events SET acked=0 WHERE day=?", [(d,) for d in resend])
         return resend
 
     def sync(self):
@@ -413,7 +414,7 @@ class Collector:
             with self.db:
                 self._set("delivery_error", str(exc))
             try:
-                self._inventory()
+                self._inventory(mark_resend=False)
             except (DeliveryError, sqlite3.Error, OSError, ValueError):
                 pass  # Keep the primary failure if its diagnostic cannot be delivered.
         return self.status()

@@ -49,6 +49,8 @@ class Receiver(BaseHTTPRequestHandler):
         body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
         state["requests"].append(body)
         status = state.get("action_status", {}).get(body["action"], state.get("status", 200))
+        if body["action"] == "events" and state.get("event_statuses"):
+            status = state["event_statuses"].pop(0)
         if self.headers.get("Authorization") != "Bearer sentinel-secret":
             status = 401
         response = {"version": 1}
@@ -340,6 +342,26 @@ class SenderTests(unittest.TestCase):
 
         with mock.patch.object(self.sender, "_post", side_effect=fail):
             self.assertEqual(self.sender.once()["last_error"], "HTTP_409")
+
+    def test_partial_upload_diagnostic_preserves_prior_batch_ack_after_restart(self):
+        records = journal()[:2]
+        records.extend(journal(response=f"resp-{i:03d}")[-1] for i in range(405))
+        self.write(records)
+        self.state["event_statuses"] = [200, 500]
+        result = self.sender.once()
+        self.assertEqual(result["last_error"], "HTTP_500")
+        self.assertEqual(len(self.state["events"]), 200)
+        self.assertEqual(result["pending_events"], 205)
+        acknowledged = set(self.state["events"])
+        next_request = len(self.state["requests"])
+        self.sender.close()
+        self.sender = self.make_sender()
+        self.assertEqual(self.sender.once()["pending_events"], 0)
+        retried = {event["response_id"] for request in self.state["requests"][next_request:]
+                   if request["action"] == "events" for event in request["events"]}
+        self.assertFalse(acknowledged & retried)
+        self.assertEqual(len(retried), 205)
+        self.assertEqual(len(self.state["events"]), 405)
 
     def test_lost_ack_replays_identical_event_after_restart(self):
         self.write()
