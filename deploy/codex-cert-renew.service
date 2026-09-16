@@ -1,0 +1,8 @@
+[Unit]
+Description=Renew Codex dashboard TLS certificate
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/opt/codex-usage/certbot-venv/bin/certbot renew --quiet --config-dir /etc/codex-usage/acme --work-dir /var/lib/codex-acme --logs-dir /var/log/codex-acme --deploy-hook "/usr/sbin/nginx -t && /bin/systemctl reload nginx"

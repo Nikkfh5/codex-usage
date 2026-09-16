@@ -1,0 +1,23 @@
+[Unit]
+Description=Codex native telemetry dashboard
+After=network.target
+
+[Service]
+Type=simple
+User=codex-usage
+Group=codex-usage
+WorkingDirectory=/opt/codex-usage/current
+ExecStart=/usr/bin/python3 /opt/codex-usage/current/server.py --central --label Aeza --data-dir /var/lib/codex-usage --ingest-token-file /etc/codex-usage/ingest.token
+Restart=on-failure
+RestartSec=3
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/codex-usage
+MemoryMax=256M
+TasksMax=64
+
+[Install]
+WantedBy=multi-user.target

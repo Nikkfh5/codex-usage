@@ -1,0 +1,8 @@
+data/
+__pycache__/
+*.log
+backups/
+local-otel.toml
+.DS_Store
+.venv/
+.worktrees/

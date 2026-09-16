@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="ru" data-theme="dark">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Codex · расход по машинам</title>
+  <script>try{document.documentElement.dataset.theme=localStorage.getItem('codex-usage-theme')==='light'?'light':'dark'}catch{}</script>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+<main>
+  <header class="page-head">
+    <div><div class="eyebrow"><span class="brand-dot"></span> CODEX / USAGE</div><h1>Понимать расход</h1><p class="muted">Машины, модели и режимы — от общей картины до отдельной сессии.</p></div>
+    <div class="head-actions"><button id="theme-toggle" class="button secondary" aria-label="Переключить тему">Светлая тема</button><span id="sync" class="status" role="status">Подключение…</span><button id="agent-open" class="button secondary">Данные для агента <span aria-hidden="true">↗</span></button></div>
+  </header>
+
+  <section aria-label="Активность машин" class="activity-section"><div class="section-label">Сигналы от машин <span class="muted">по получению телеметрии</span></div><div id="activity" class="activity-grid"></div><details id="hidden-machines" hidden><summary id="hidden-count">Скрытые карточки</summary><div id="hidden-list"></div><p class="micro">Убраны только карточки. История и сбор данных сохранены.</p></details><p class="micro">Тихая машина может просто не использовать Codex. Это свежесть событий, а не проверка питания или постоянного соединения.</p></section>
+
+  <section class="filters" aria-label="Фильтры аналитики">
+    <div class="filter-row">
+      <label>Период<select id="period"><option value="1">Последний час</option><option value="24">24 часа</option><option value="168">7 дней</option><option value="720" selected>30 дней</option><option value="today">Сегодня</option><option value="yesterday">Вчера</option><option value="custom">Свои даты</option></select></label>
+      <label>Машина<select id="machine"><option value="">Все машины</option></select></label>
+      <label>Модель<select id="model"><option value="">Все модели</option></select></label>
+      <label>Effort<select id="effort"><option value="">Любой effort</option></select></label>
+      <label>Скорость<select id="tier"><option value="">Все режимы</option></select></label>
+      <button id="reset" class="text-button">Сбросить</button>
+    </div>
+    <div class="filter-bottom"><div id="custom-dates" class="custom-dates" hidden><label>С даты<input id="from-date" type="date"></label><label>По дату включительно<input id="to-date" type="date"></label><button id="apply-dates" class="button secondary">Применить</button></div><label class="check"><input id="zero-output" type="checkbox" checked>Учитывать запросы без выхода</label><span id="range-label" class="micro"></span></div>
+  </section>
+  <p id="error" class="error" role="alert" hidden></p>
+
+  <section class="kpis" aria-label="Итоги выбранного периода">
+    <article class="kpi primary"><div class="kpi-label">Все токены</div><div class="value" id="total">—</div><div id="total-change" class="kpi-note">за выбранный период</div></article>
+    <article class="kpi"><div class="kpi-label"><i class="dot uncached"></i>Вход без кэша</div><div class="value" id="uncached">—</div><div id="uncached-note" class="kpi-note">—</div></article>
+    <article class="kpi"><div class="kpi-label"><i class="dot cache"></i>Кэш</div><div class="value" id="cache">—</div><div id="cache-note" class="kpi-note">—</div></article>
+    <article class="kpi"><div class="kpi-label"><i class="dot reasoning"></i>Reasoning</div><div class="value" id="reasoning">—</div><div id="reasoning-note" class="kpi-note">—</div></article>
+    <article class="kpi"><div class="kpi-label"><i class="dot visible"></i>Выход без reasoning</div><div class="value" id="visible">—</div><div id="visible-note" class="kpi-note">—</div></article>
+  </section>
+  <div class="summary-strip"><span id="sample-count">—</span><span id="average">—</span><span id="input-total">—</span><span id="coverage">—</span></div>
+
+  <section class="panel cost-panel" aria-label="Оценка стоимости API">
+    <div class="cost-main"><div class="kpi-label">Эквивалент по тарифам API</div><div id="api-cost" class="value">—</div><button id="pricing-open" class="text-button">Тарифы и расчёт ↗</button></div>
+    <div class="cost-breakdown"><div><span>Обычный вход</span><strong id="cost-input">—</strong></div><div><span>Чтение кэша</span><strong id="cost-read">—</strong></div><div><span>Запись кэша</span><strong id="cost-write">—</strong></div><div><span>Выход с reasoning</span><strong id="cost-output">—</strong></div></div>
+    <p id="cost-note" class="micro cost-note"></p>
+  </section>
+
+  <section class="panel chart-panel">
+    <div class="panel-head"><div><h2>Как меняется расход</h2><p id="chart-caption" class="micro">Наведите на столбец, чтобы увидеть значения.</p></div><div class="compact-controls"><label class="sr-only" for="chart-mode">Вид графика</label><select id="chart-mode"><option value="tokens">Структура токенов</option><option value="machines">По машинам</option><option value="trend">Тренд и прошлый период</option></select><label class="sr-only" for="chart-metric">Метрика графика</label><select id="chart-metric"><option value="total_tokens">Все токены</option><option value="uncached_input_tokens">Вход без кэша</option><option value="cached_input_tokens">Кэш</option><option value="reasoning_output_tokens">Reasoning</option><option value="api_cost_known_usd">Оценка API, $</option></select></div></div>
+    <div id="legend" class="legend"></div><div id="chart" class="chart"></div><div id="tooltip" class="tooltip" role="status" hidden></div>
+    <div id="comparison-note" class="chart-foot micro"></div>
+  </section>
+
+  <section class="analysis-grid">
+    <article class="panel breakdown-panel"><div class="panel-head"><div><h2>Что даёт основной объём</h2><p class="micro">Нажмите строку, чтобы уточнить выборку.</p></div><div class="ranking-controls"><label class="sr-only" for="ranking-metric">Метрика рейтинга</label><select id="ranking-metric"><option value="total_tokens">Токены</option><option value="api_cost_known_usd">API, $</option></select><label class="sr-only" for="group-by">Разбивка</label><select id="group-by"><option value="machine">Машины</option><option value="model">Модели</option><option value="effort">Effort</option><option value="tier">Fast / стандарт</option></select></div></div><div id="rankings" class="rankings"></div></article>
+    <article class="panel ratio-panel"><div class="panel-head"><div><h2>Доли и соотношения</h2><p class="micro">Проценты рассчитаны от указанной базы.</p></div></div><div id="ratios" class="ratio-list"></div></article>
+  </section>
+
+  <section class="panel"><div class="panel-head"><div><h2>Сессии с наибольшим расходом</h2><p id="session-count" class="micro">Откройте сессию для подробностей.</p></div><button id="csv-download" class="button secondary">Скачать CSV <span aria-hidden="true">↓</span></button></div><div class="table-wrap"><table><thead><tr><th>Сессия / машина</th><th>Модель и режим</th><th class="num">Все токены</th><th class="num">Оценка API</th><th class="num">Без кэша · вход</th><th class="num">Кэш / все</th><th class="num">Reasoning / выход</th><th class="num">Запросы</th></tr></thead><tbody id="sessions"></tbody></table></div><p id="sessions-empty" class="empty" hidden>Сессий в этой выборке пока нет.</p></section>
+  <footer><span>Сумма событий Codex. Кэш входит во входные токены, reasoning — в выходные. Это не счёт за подписку и не оценка качества работы.</span><span id="data-start"></span></footer>
+</main>
+
+<dialog id="session-dialog" class="detail-dialog"><div class="dialog-head"><div><div class="eyebrow">СЕССИЯ</div><h2 id="detail-title"></h2><p id="detail-subtitle" class="micro"></p></div><button data-close="session-dialog" class="icon-button" aria-label="Закрыть">×</button></div><div id="session-detail"></div></dialog>
+<dialog id="agent-dialog"><div class="dialog-head"><div><div class="eyebrow">ДОСТУП К АНАЛИТИКЕ</div><h2>Разобрать расход с агентом</h2></div><button data-close="agent-dialog" class="icon-button" aria-label="Закрыть">×</button></div><p>Скачайте текущую выборку и передайте агенту вместе с этим запросом. В файле будут цифры, режимы и правила расчёта; содержимое переписки не включается.</p><textarea id="agent-prompt" readonly rows="7" aria-label="Промпт для анализа"></textarea><div class="dialog-actions"><button id="copy-prompt" class="button secondary">Копировать запрос</button><button id="json-download" class="button">Скачать аналитику JSON</button></div><p class="micro">Для программного доступа: <a href="/api/v1/schema" target="_blank" rel="noopener">описание JSON API</a> и <a href="/agent-guide.md" target="_blank" rel="noopener">инструкция</a>. Аналитика доступна через логин и пароль сайта.</p></dialog>
+<dialog id="pricing-dialog"><div class="dialog-head"><div><div class="eyebrow">ОЦЕНКА В ДОЛЛАРАХ</div><h2>Как считается стоимость</h2></div><button data-close="pricing-dialog" class="icon-button" aria-label="Закрыть">×</button></div><p>Стоимость этих токенов по тарифам API на <strong>6 сентября 2026</strong>. Это ориентир для сравнения расхода, а не списание подписки Codex.</p><p class="micro">Вход без чтения и записи кэша × тариф входа + чтение кэша × тариф кэша + запись кэша × тариф записи + весь выход × тариф выхода. Reasoning уже входит в выход.</p><p class="micro">Известные Fast и Flex учитываются. При неизвестной скорости используется Standard с явной пометкой. Если не хватает счётчиков или тарифа, показана только рассчитанная часть (≥).</p><div id="pricing-rates" class="table-wrap"></div><p class="micro">Цены в таблице — Standard за 1 млн токенов. Для GPT-5.6/6 Fast стоит ×2; для GPT-5.5 — ×2,5. Длинный контекст свыше 272 тыс. входных токенов учитывается отдельно. Платные вызовы инструментов, региональные надбавки и налоги не включены.</p><p class="micro"><a href="https://developers.openai.com/api/docs/pricing" target="_blank" rel="noopener">Официальные тарифы OpenAI ↗</a> · <a href="https://developers.openai.com/api/docs/guides/prompt-caching" target="_blank" rel="noopener">Расчёт кэша ↗</a></p></dialog>
+<script type="module" src="/dashboard.js"></script>
+</body></html>
