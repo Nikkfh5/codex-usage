@@ -396,7 +396,12 @@ class Collector:
                 self.db.executemany("UPDATE events SET acked=1 WHERE response_id=?", [(v,) for v in accepted])
 
     def _inventory(self, mark_resend=True):
-        days = day_inventory(json.loads(r[0]) for r in self.db.execute("SELECT data FROM events"))
+        grouped = {}
+        for day, response_id, digest in self.db.execute("SELECT day,response_id,digest FROM events"):
+            grouped.setdefault(day, []).append(response_id + ":" + digest + "\n")
+        days = [dict(day=day, count=len(rows),
+                     digest=hashlib.sha256("".join(sorted(rows)).encode()).hexdigest())
+                for day, rows in sorted(grouped.items())]
         current = self.status()
         result = self._post("inventory", days=days, status={k: current[k] for k in ("scanned_at_ms", "pending_events", "pending_tokens", "last_error")})
         if result.get("server_only_days"):

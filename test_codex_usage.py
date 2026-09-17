@@ -131,6 +131,32 @@ class SenderTests(unittest.TestCase):
             with self.subTest(bad=bad), self.assertRaises(ValueError):
                 usage.canonical_event(event(**bad))
 
+    def test_inventory_matches_reference_across_days_and_restart(self):
+        batches = (
+            [],
+            [event("resp:z"), event("resp"), event("ответ"),
+             event("next-day", timestamp_ms=1789689601000)],
+            [event("later-same-day"),
+             event("third-day", timestamp_ms=1789776001000)],
+        )
+        for batch in batches:
+            with self.sender.db:
+                for index, raw in enumerate(batch):
+                    item = usage.canonical_event(raw)
+                    self.sender.db.execute(
+                        "INSERT INTO events(response_id,session,day,digest,data,total_tokens,acked) "
+                        "VALUES(?,?,?,?,?,?,?)",
+                        (item["response_id"], item["session"], item["event_timestamp"][:10],
+                         usage.event_digest(item), usage.compact(item),
+                         item["total_tokens"], index % 2))
+                    self.state["events"][item["response_id"]] = item
+            expected = usage.day_inventory(self.state["events"].values())
+            for _ in range(2):
+                self.assertEqual(self.sender._inventory(), [])
+                self.assertEqual(self.state["requests"][-1]["days"], expected)
+                self.sender.close()
+                self.sender = self.make_sender()
+
     def test_rejects_json_inexact_large_integers(self):
         with self.assertRaises(ValueError):
             usage.canonical_event(event(input_tokens=2**53, cached_input_tokens=0,
