@@ -71,6 +71,11 @@ class Receiver(BaseHTTPRequestHandler):
             elif body["action"] == "activate":
                 state["active"].update(body["sessions"])
                 response["activated"] = body["sessions"]
+            elif body["action"] == "inspect":
+                response["sessions"] = [{"session": session, "machines": [], "collectors": [],
+                    "active_collector": None, "active_machine": None, "before_since": False,
+                    "events": 0, "total_tokens": 0, **state.get("ownership", {}).get(session, {})}
+                    for session in body["sessions"]]
         else:
             response["error"] = "sentinel-secret raw server message"
         data = json.dumps(response).encode()
@@ -451,6 +456,8 @@ class SenderTests(unittest.TestCase):
         self.assertIn("Get-ScheduledTask -TaskPath", command)
         self.assertIn("if($existing)", command)
         self.assertIn("Stop-ScheduledTask -InputObject $existing -ErrorAction Stop", command)
+        self.assertIn("sender_stop_timeout", command)
+        self.assertIn(".State -eq 'Running'", command)
         self.assertLess(command.index("Stop-ScheduledTask"), command.index("Register-ScheduledTask"))
         self.assertLess(command.index("Register-ScheduledTask"), command.index("Start-ScheduledTask"))
         self.assertNotIn("SilentlyContinue", command)
@@ -469,6 +476,219 @@ class SenderTests(unittest.TestCase):
             ["systemctl", "--user", "restart", "codex-usage-collecto.service"],
         ])
         self.assertTrue(all(call.kwargs["check"] for call in run.call_args_list))
+
+    def prepare_history(self, session="session-old", **owner):
+        path = self.write(journal(session=session, created="2026-09-01T00:00:00Z"))
+        (self.root / "state" / "config.json").write_text(json.dumps(self.config))
+        self.state["ownership"] = {session: dict(machines=["test-machine"], **owner)}
+        return path
+
+    def test_backfill_dry_run_finds_old_continued_session_without_mutating_state(self):
+        self.prepare_history()
+        ended = journal(session="ended", created="2026-09-01T00:00:00Z", response="ended-response")
+        ended[-1]["timestamp"] = "2026-09-04T23:59:59Z"
+        self.write(ended, name="ended.jsonl")
+        before = {p.name: p.read_bytes() for p in (self.root / "state").iterdir()}
+        result = usage.backfill(self.root / "state", "2026-09-05")
+        self.assertEqual(result["sessions"][0]["status"], "safe")
+        self.assertEqual(result["sessions"][0]["local_events"], 1)
+        self.assertEqual(result["sessions"][0]["local_tokens"], 120)
+        self.assertFalse(result["applied"])
+        self.assertEqual(before, {p.name: p.read_bytes() for p in (self.root / "state").iterdir()})
+        self.assertEqual([r["action"] for r in self.state["requests"]], ["inspect"])
+        self.assertEqual(self.state["requests"][0]["sessions"], ["session-old"])
+        self.assertFalse(self.state["events"])
+        self.assertNotIn("sentinel-secret", json.dumps(result))
+
+    def test_backfill_blocks_unknown_multiple_foreign_and_competing_owners(self):
+        self.prepare_history()
+        cases = [({}, "unknown_owner"),
+                 ({"machines": ["other-machine"]}, "foreign_machine"),
+                 ({"machines": ["test-machine", "other-machine"]}, "multiple_machines"),
+                 ({"machines": ["test-machine"], "collectors": ["another"]}, "foreign_collector"),
+                 ({"machines": ["test-machine"], "active_collector": "another", "active_machine": "test-machine"}, "foreign_collector"),
+                 ({"machines": ["test-machine"], "before_since": True}, "server_history_before_since")]
+        for owner, reason in cases:
+            with self.subTest(reason=reason):
+                self.state["ownership"]["session-old"] = owner
+                result = usage.backfill(self.root / "state", "2026-09-05", apply=True)
+                self.assertEqual(result["sessions"][0]["reason"], reason)
+                self.assertEqual(result["sessions"][0]["status"], "blocked")
+                self.assertEqual(usage.read_config(self.root / "state" / "config.json")["adopt_sessions"], [])
+                self.assertFalse(self.state["events"])
+
+    def test_backfill_ignores_legacy_prefix_but_enforces_requested_window(self):
+        path = self.prepare_history()
+        old_usage = journal(response="old-response")[-1]
+        old_usage["timestamp"] = "2026-09-04T23:59:58Z"
+        old_usage["payload"].update(thread_id="unverified-old-thread", usage={"input_tokens": "legacy"})
+        legacy = dict(timestamp="2026-09-04T23:59:59Z", type="event_msg",
+                      payload=dict(type="token_count", info={"total_token_usage": {"total_tokens": 999}}))
+        records = journal(session="session-old", created="2026-09-01T00:00:00Z")
+        self.write(records[:2] + [old_usage, legacy] + records[2:])
+        result = usage.backfill(self.root / "state", "2026-09-05", apply=True)
+        self.assertEqual(result["sessions"][0]["status"], "safe")
+        self.assertEqual(set(self.state["events"]), {"resp-1"})
+        self.assertEqual(self.state["events"]["resp-1"]["effort"], "high")
+        config = usage.read_config(self.root / "state" / "config.json")
+        self.assertEqual(config["history_since"], {"session-old": usage.timestamp_ms("2026-09-05T00:00:00Z")})
+        activations = [r for r in self.state["requests"] if r["action"] == "activate"]
+        self.assertEqual(activations[-1]["since_ms"], config["history_since"]["session-old"])
+        legacy["timestamp"] = "2026-09-05T00:00:00Z"
+        self.write(records[:2] + [legacy] + records[2:])
+        result = usage.backfill(self.root / "state", "2026-09-05")
+        self.assertEqual(result["sessions"][0]["reason"], "unsupported_format")
+
+    def test_backfill_failed_inspection_and_invalid_local_files_cannot_adopt(self):
+        path = self.prepare_history()
+        before = (self.root / "state" / "config.json").read_bytes()
+        self.state["action_status"] = {"inspect": 500}
+        result = usage.backfill(self.root / "state", "2026-09-05", apply=True)
+        self.assertEqual(result["last_error"], "HTTP_500")
+        self.assertFalse(result["applied"])
+        self.assertEqual(before, (self.root / "state" / "config.json").read_bytes())
+        self.assertFalse(list((self.root / "state").glob("*.backup-*")))
+        self.state["action_status"].clear()
+        with path.open("a", encoding="utf-8") as stream:
+            stream.write('{"timestamp":')
+        result = usage.backfill(self.root / "state", "2026-09-05", apply=True)
+        self.assertEqual(result["sessions"][0]["reason"], "incomplete_journal")
+        self.assertFalse(self.state["events"])
+
+    def test_backfill_backup_reapply_lost_ack_and_existing_scope(self):
+        self.prepare_history()
+        before = (self.root / "state" / "config.json").read_bytes()
+        self.state["lose_ack"] = True
+        first = usage.backfill(self.root / "state", "2026-09-05", apply=True)
+        self.assertEqual(first["pending_events"], 1)
+        self.assertTrue(first["applied"])
+        config_backups = list((self.root / "state").glob("config.backup-*.json"))
+        self.assertEqual(len(config_backups), 1)
+        self.assertEqual(config_backups[0].read_bytes(), before)
+        backups = list((self.root / "state").glob("ledger.backup-*.sqlite"))
+        self.assertEqual(len(backups), 1)
+        with contextlib.closing(__import__("sqlite3").connect(backups[0])) as db:
+            self.assertEqual(db.execute("PRAGMA quick_check").fetchone()[0], "ok")
+        second = usage.backfill(self.root / "state", "2026-09-06", apply=True)
+        self.assertEqual(second["pending_events"], 0)
+        self.assertEqual(len(self.state["events"]), 1)
+        self.assertEqual(usage.read_config(self.root / "state" / "config.json")["history_since"]["session-old"],
+                         usage.timestamp_ms("2026-09-05T00:00:00Z"))
+        config = usage.read_config(self.root / "state" / "config.json")
+        config.pop("history_since")
+        (self.root / "state" / "config.json").write_text(json.dumps(config))
+        self.state["ownership"]["session-old"].update(active_collector="collector-1", active_machine="test-machine", before_since=True)
+        third = usage.backfill(self.root / "state", "2026-09-05", apply=True)
+        self.assertEqual(third["sessions"][0]["reason"], "already_active")
+        self.assertEqual(usage.read_config(self.root / "state" / "config.json").get("history_since", {}).get("session-old", 0), 0)
+
+    def test_install_backfill_preserves_identity_and_runs_before_startup(self):
+        self.prepare_history()
+        def startup(state_dir, script, collector, **kwargs):
+            self.assertEqual(self.state["active"], {"session-old"})
+            self.assertEqual(collector, self.config["collector_id"])
+            return "test_startup"
+        with mock.patch.object(usage, "install_startup", side_effect=startup):
+            result = usage.install(self.root / "state", self.home, backfill_since="2026-09-05")
+        config = usage.read_config(self.root / "state" / "config.json")
+        for key in ("collector_id", "baseline_ms", "token", "machine"):
+            self.assertEqual(config[key], self.config[key])
+        self.assertEqual(result["autostart"], "test_startup")
+        self.assertNotIn("sentinel-secret", json.dumps(result))
+        with mock.patch.object(usage, "backfill", return_value={"applied": False}) as backfill, contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(usage.main(["backfill", "--state-dir", str(self.root / "state"), "--since", "2026-09-05"]), 0)
+        self.assertEqual(backfill.call_args.args[:2], (self.root / "state", "2026-09-05"))
+
+    def test_install_stops_old_sender_and_restores_autostart_after_failed_inspection(self):
+        self.prepare_history()
+        target = self.root / "state"
+        script = target / "codex_usage.py"
+        script.write_text("old sender")
+        self.state["action_status"] = {"inspect": 500}
+        actions = []
+        def stop(collector_id):
+            self.assertEqual(script.read_text(), "old sender")
+            self.assertEqual(usage.read_config(target / "config.json")["adopt_sessions"], [])
+            actions.append("stop")
+        def start(state_dir, installed, collector_id, **kwargs):
+            self.assertEqual(script.read_bytes(), Path(usage.__file__).read_bytes())
+            self.assertEqual(usage.read_config(target / "config.json")["collector_id"], self.config["collector_id"])
+            actions.append("start")
+            self.assertFalse(kwargs["stop_existing"])
+            return "test_startup"
+        with mock.patch.object(usage, "stop_startup", side_effect=stop), mock.patch.object(usage, "install_startup", side_effect=start):
+            result = usage.install(target, self.home, backfill_since="2026-09-05")
+        self.assertEqual(actions, ["stop", "start"])
+        self.assertEqual(result["last_error"], "HTTP_500")
+        self.assertEqual(result["autostart"], "test_startup")
+        self.assertEqual(usage.read_config(target / "config.json")["adopt_sessions"], [])
+        self.assertTrue(list(target.glob("config.backup-*.json")))
+
+    def test_standalone_backfill_requires_updated_installed_sender(self):
+        self.prepare_history()
+        target = self.root / "state"
+        (target / "codex_usage.py").write_text("old sender")
+        before = {p.name: p.read_bytes() for p in target.iterdir()}
+        result = usage.backfill(target, "2026-09-05", apply=True)
+        self.assertEqual(result["last_error"], "sender_update_required")
+        self.assertFalse(result["applied"])
+        self.assertEqual(before, {p.name: p.read_bytes() for p in target.iterdir()})
+        self.assertFalse(self.state["events"])
+
+    def test_install_exception_after_stop_restores_existing_sender(self):
+        self.prepare_history()
+        target = self.root / "state"
+        script = target / "codex_usage.py"
+        script.write_text("old sender")
+        before = (target / "config.json").read_bytes()
+        with mock.patch.object(usage, "backfill", side_effect=ValueError("simulated_history_error")), mock.patch.object(usage, "stop_startup") as stop, mock.patch.object(usage, "install_startup") as start:
+            with self.assertRaisesRegex(ValueError, "simulated_history_error"):
+                usage.install(target, self.home, backfill_since="2026-09-05")
+        stop.assert_called_once()
+        start.assert_called_once()
+        self.assertEqual(before, (target / "config.json").read_bytes())
+        script.write_text("old sender")
+        def failed_copy(source, destination):
+            Path(destination).write_text("truncated")
+            raise OSError("simulated_copy_error")
+        with mock.patch.object(usage, "shutil") as shutil, mock.patch.object(usage, "stop_startup"), mock.patch.object(usage, "install_startup") as start:
+            shutil.copyfile.side_effect = failed_copy
+            with self.assertRaisesRegex(OSError, "simulated_copy_error"):
+                usage.install(target, self.home, backfill_since="2026-09-05")
+        start.assert_called_once()
+        self.assertEqual(script.read_text(), "old sender")
+
+    def test_fresh_install_without_journals_still_enables_future_collection(self):
+        target = self.root / "fresh-install"
+        (self.home / "sessions").rename(self.home / "missing-sessions")
+        with mock.patch.object(usage, "install_startup", return_value="test_startup") as start:
+            result = usage.install(target, self.home, machine="test-machine", endpoint=self.config["endpoint"],
+                                   token="sentinel-secret", backfill_since="2026-09-05")
+        self.assertEqual(result["last_error"], "sessions_missing")
+        self.assertEqual(result["autostart"], "test_startup")
+        self.assertEqual(usage.read_config(target / "config.json")["adopt_sessions"], [])
+        start.assert_called_once()
+
+    def test_backfill_reports_previously_limited_scope_without_widening_it(self):
+        self.config.update(adopt_sessions=["session-old"], history_since={"session-old": usage.timestamp_ms("2026-09-10T00:00:00Z")})
+        self.prepare_history(active_collector="collector-1", active_machine="test-machine")
+        result = usage.backfill(self.root / "state", "2026-09-05")
+        self.assertEqual(result["sessions"][0]["reason"], "history_window_already_limited")
+        self.assertEqual(result["sessions"][0]["effective_since_ms"], self.config["history_since"]["session-old"])
+
+    def test_backfill_bounds_inspection_and_groups_activation_by_scope(self):
+        self.prepare_history()
+        for index in range(201):
+            self.write(journal(session=f"old-{index}", created="2026-09-01T00:00:00Z", response=f"response-{index}"), name=f"old-{index}.jsonl")
+        usage.backfill(self.root / "state", "2026-09-05")
+        inspections = [r for r in self.state["requests"] if r["action"] == "inspect"]
+        self.assertEqual([len(r["sessions"]) for r in inspections], [200, 2])
+        self.sender.config.update(adopt_sessions=["session-old"], history_since={"session-old": usage.timestamp_ms("2026-09-05T00:00:00Z")})
+        self.write(journal(response="new-response"), name="new.jsonl")
+        self.sender.scan()
+        self.sender.sync()
+        activations = [r for r in self.state["requests"] if r["action"] == "activate"]
+        self.assertEqual({r["since_ms"]: r["sessions"] for r in activations}, {0: ["session-new"], usage.timestamp_ms("2026-09-05T00:00:00Z"): ["session-old"]})
 
 
 if __name__ == "__main__":

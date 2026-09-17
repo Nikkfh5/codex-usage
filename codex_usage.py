@@ -4,6 +4,7 @@
 The three canonical helpers remain importable on the receiver's Python 3.10.
 """
 import argparse
+import contextlib
 import datetime as dt
 import getpass
 import hashlib
@@ -17,6 +18,7 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.parse
@@ -122,6 +124,9 @@ def validate_config(config):
     adopted = config.get("adopt_sessions", [])
     if not isinstance(adopted, list) or any(not isinstance(s, str) or not s for s in adopted):
         raise ValueError("invalid_adoption")
+    history = config.get("history_since", {})
+    if not isinstance(history, dict) or any(s not in adopted or type(value) is not int or not 0 <= value <= 9007199254740991 for s, value in history.items()):
+        raise ValueError("invalid_history_since")
     validate_endpoint(config["endpoint"])
 
 
@@ -290,9 +295,12 @@ class Collector:
                         elif kind == "turn_context":
                             context.update(model=payload.get("model"), effort=payload.get("effort"), service_tier=payload.get("service_tier"))
                         elif kind == "event_msg" and payload.get("type") == "token_count" and payload.get("info"):
+                            since_ms = self.config.get("history_since", {}).get(context["session"], 0)
                             info = payload["info"]
                             last = info.get("last_token_usage") if isinstance(info, dict) else None
-                            if not isinstance(last, dict) or any(type(last.get(k)) is not int or last[k] < 0 for k in ("input_tokens", "output_tokens")):
+                            if since_ms and timestamp_ms(record.get("timestamp")) < since_ms:
+                                pass  # Legacy prefixes outside the adopted window are not usage.
+                            elif not isinstance(last, dict) or any(type(last.get(k)) is not int or last[k] < 0 for k in ("input_tokens", "output_tokens")):
                                 total = info.get("total_token_usage", {}) if isinstance(info, dict) else {}
                                 if not context.get("last_usage") or (isinstance(total, dict) and any(type(v) is int and v > 0 for v in total.values())):
                                     raise DeliveryError("unsupported_format")
@@ -303,23 +311,29 @@ class Collector:
                         elif kind == "token_usage_record":
                             # session_id can identify an API/subagent session; thread_id
                             # is the journal's stable session_meta.id.
-                            if payload.get("thread_id", context["session"]) != context["session"]:
-                                raise DeliveryError("session_conflict")
+                            event_ms = timestamp_ms(record.get("timestamp"))
+                            since_ms = self.config.get("history_since", {}).get(context["session"], 0)
                             counters = payload.get("usage")
-                            if not isinstance(counters, dict):
+                            if event_ms < since_ms:
+                                if isinstance(counters, dict):
+                                    context["last_usage"] = {k: counters.get(k) for k in TOKEN_KEYS}
+                            elif payload.get("thread_id", context["session"]) != context["session"]:
+                                raise DeliveryError("session_conflict")
+                            elif not isinstance(counters, dict):
                                 raise ValueError("invalid_usage")
-                            event = canonical_event(dict(
-                                **{k: counters.get(k) for k in TOKEN_KEYS},
-                                **{k: context.get(k) for k in ("session", "client_version", "model", "effort", "service_tier")},
-                                response_id=payload.get("response_id"), timestamp_ms=timestamp_ms(record.get("timestamp")),
-                                machine=self.config["machine"], collector_id=self.config["collector_id"]))
-                            previous = self.db.execute("SELECT digest FROM events WHERE response_id=?", (event["response_id"],)).fetchone()
-                            event_hash = event_digest(event)
-                            if previous and previous[0] != event_hash:
-                                raise DeliveryError("response_conflict")
-                            self.db.execute("INSERT OR IGNORE INTO events(response_id,session,day,digest,data,total_tokens) VALUES(?,?,?,?,?,?)",
-                                            (event["response_id"], event["session"], event["event_timestamp"][:10], event_hash, compact(event), event["total_tokens"]))
-                            context["last_usage"] = {k: event[k] for k in TOKEN_KEYS}
+                            else:
+                                event = canonical_event(dict(
+                                    **{k: counters.get(k) for k in TOKEN_KEYS},
+                                    **{k: context.get(k) for k in ("session", "client_version", "model", "effort", "service_tier")},
+                                    response_id=payload.get("response_id"), timestamp_ms=event_ms,
+                                    machine=self.config["machine"], collector_id=self.config["collector_id"]))
+                                previous = self.db.execute("SELECT digest FROM events WHERE response_id=?", (event["response_id"],)).fetchone()
+                                event_hash = event_digest(event)
+                                if previous and previous[0] != event_hash:
+                                    raise DeliveryError("response_conflict")
+                                self.db.execute("INSERT OR IGNORE INTO events(response_id,session,day,digest,data,total_tokens) VALUES(?,?,?,?,?,?)",
+                                                (event["response_id"], event["session"], event["event_timestamp"][:10], event_hash, compact(event), event["total_tokens"]))
+                                context["last_usage"] = {k: event[k] for k in TOKEN_KEYS}
                     except DeliveryError as exc:
                         state["error"] = str(exc)
                         break
@@ -397,11 +411,15 @@ class Collector:
                     AND EXISTS(SELECT 1 FROM events WHERE events.session=files.session)
                     AND NOT EXISTS(SELECT 1 FROM events WHERE events.session=files.session AND acked=0)
                 """)]
-                for index in range(0, len(sessions), 200):
-                    batch = sessions[index:index + 200]
-                    result = self._post("activate", sessions=batch)
-                    if result.get("activated") != batch:
-                        raise DeliveryError("invalid_activation_ack")
+                windows = {}
+                for session in sessions:
+                    windows.setdefault(self.config.get("history_since", {}).get(session, 0), []).append(session)
+                for since_ms, group in windows.items():
+                    for index in range(0, len(group), 200):
+                        batch = group[index:index + 200]
+                        result = self._post("activate", sessions=batch, since_ms=since_ms)
+                        if result.get("activated") != batch:
+                            raise DeliveryError("invalid_activation_ack")
             if self._inventory():
                 raise DeliveryError("inventory_mismatch")
             with self.db:
@@ -437,8 +455,190 @@ def read_config(path):
         return json.load(stream)
 
 
+def write_config(path, config):
+    temporary = path.with_suffix(".tmp")
+    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+        stream.write(compact(config))
+        stream.flush()
+        os.fsync(stream.fileno())
+    os.replace(temporary, path)
+    os.chmod(path, 0o600)
+
+
+def history_cutoff(since):
+    if dt.date.fromisoformat(since).isoformat() != since:
+        raise ValueError("invalid_since")
+    since_ms = timestamp_ms(since + "T00:00:00Z")
+    if since_ms < 0:
+        raise ValueError("invalid_since")
+    return since_ms
+
+
+def backup_state(state_dir):
+    suffix = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+    config_path = state_dir / "config.json"
+    if config_path.exists():
+        backup = state_dir / ("config.backup-" + suffix + ".json")
+        shutil.copyfile(config_path, backup)
+        os.chmod(backup, 0o600)
+    ledger = state_dir / "ledger.sqlite"
+    if ledger.exists():
+        backup = state_dir / ("ledger.backup-" + suffix + ".sqlite")
+        with contextlib.closing(sqlite3.connect(ledger.as_uri() + "?mode=ro", uri=True)) as source, contextlib.closing(sqlite3.connect(backup)) as destination:
+            source.backup(destination)
+        os.chmod(backup, 0o600)
+
+
+def backfill(state_dir, since, apply=False, config=None):
+    """Compare owned history in temporary state; persist only an explicit apply."""
+    since_ms = history_cutoff(since)
+    state_dir = Path(state_dir).resolve()
+    config_path = state_dir / "config.json"
+    config = dict(config if config is not None else read_config(config_path))
+    validate_config(config)
+    result = dict(since=since, since_ms=since_ms, applied=False, sessions=[], last_error=None)
+    installed = state_dir / "codex_usage.py"
+    if apply and installed.exists() and installed.read_bytes() != Path(__file__).read_bytes():
+        result["last_error"] = "sender_update_required"
+        return result
+    home = Path(config["codex_home"])
+    if not (home / "sessions").is_dir():
+        result["last_error"] = "sessions_missing"
+        return result
+    paths = sorted(list((home / "sessions").rglob("*.jsonl")) + list((home / "archived_sessions").rglob("*.jsonl")))
+    candidates, rows = {}, []
+    for path in paths:
+        try:
+            with path.open("rb") as stream:
+                first = json.loads(stream.readline(1024 * 1024))
+                meta = first.get("payload", {})
+                session = meta.get("id")
+                if first.get("type") != "session_meta" or not isinstance(session, str) or not session or len(session) > 256 or any(ord(c) < 32 for c in session):
+                    raise ValueError("invalid_session_meta")
+                created_ms = timestamp_ms(meta.get("timestamp", first.get("timestamp")))
+                # A resumed old session belongs in the window. Only an ended tail
+                # can exclude a file; file mtimes and cwd are never provenance.
+                size = stream.seek(0, os.SEEK_END)
+                start = max(0, size - 65536)
+                stream.seek(start)
+                tail = stream.read()
+                lines = tail.splitlines()[1:] if start else tail.splitlines()
+                stamps = []
+                for line in reversed(lines):
+                    try:
+                        stamps.append(timestamp_ms(json.loads(line).get("timestamp")))
+                    except (ValueError, TypeError, AttributeError):
+                        continue
+                if tail.endswith(b"\n") and stamps and max(stamps + [created_ms]) < since_ms:
+                    continue
+                candidates.setdefault(session, []).append(path)
+        except (OSError, ValueError, TypeError, AttributeError):
+            rows.append(dict(session=None, file=path.name, status="blocked", reason="invalid_session_meta"))
+    result["sessions"] = rows
+    adopted = set(config.get("adopt_sessions", []))
+    history = config.get("history_since", {})
+    probe_config = dict(config, adopt_sessions=sorted(adopted | candidates.keys()),
+                        history_since={**history, **{s: history.get(s, 0) if s in adopted else since_ms for s in candidates}})
+    with tempfile.TemporaryDirectory(prefix="codex-usage-backfill-") as temporary:
+        probe = Collector(probe_config, temporary)
+        try:
+            for session, session_paths in candidates.items():
+                for path in session_paths:
+                    try:
+                        probe._scan_file(path, str(path.resolve()))
+                    except OSError:
+                        rows.append(dict(session=session, status="blocked", reason="file_read_error"))
+                        break
+                else:
+                    files = probe.db.execute("SELECT complete,error FROM files WHERE session=?", (session,)).fetchall()
+                    reason = next((r["error"] for r in files if r["error"]), None)
+                    if not reason and (not files or not all(r["complete"] for r in files)):
+                        reason = "incomplete_journal"
+                    count, total = probe.db.execute("SELECT count(*),coalesce(sum(total_tokens),0) FROM events WHERE session=? AND day>=?", (session, since)).fetchone()
+                    if not reason and not total:
+                        reason = "no_usage_in_window"
+                    rows.append(dict(session=session, local_events=count, local_tokens=total,
+                                     effective_since_ms=probe_config["history_since"][session],
+                                     status="blocked" if reason else "pending", reason=reason))
+            owners = {}
+            sessions = sorted(candidates)
+            for index in range(0, len(sessions), 200):
+                batch = sessions[index:index + 200]
+                inspected = probe._post("inspect", sessions=batch, since_ms=since_ms).get("sessions")
+                if not isinstance(inspected, list) or len(inspected) != len(batch):
+                    raise DeliveryError("invalid_inspection")
+                for owner in inspected:
+                    if not isinstance(owner, dict) or owner.get("session") not in batch or owner["session"] in owners:
+                        raise DeliveryError("invalid_inspection")
+                    if any(not isinstance(owner.get(k), list) or any(not isinstance(v, str) or not v for v in owner[k]) for k in ("machines", "collectors")):
+                        raise DeliveryError("invalid_inspection")
+                    if any(type(owner.get(k)) is not int or owner[k] < 0 for k in ("events", "total_tokens")) or type(owner.get("before_since")) is not bool:
+                        raise DeliveryError("invalid_inspection")
+                    if any(k not in owner or (owner[k] is not None and not isinstance(owner[k], str)) for k in ("active_machine", "active_collector")):
+                        raise DeliveryError("invalid_inspection")
+                    owners[owner["session"]] = owner
+            for row in rows:
+                owner = owners.get(row["session"])
+                if owner is None:
+                    continue
+                row.update(server_events=owner["events"], server_tokens=owner["total_tokens"],
+                           **{k: owner[k] for k in ("machines", "collectors", "active_machine", "active_collector", "before_since")})
+                if row["status"] == "blocked":
+                    continue
+                machines = set(owner["machines"])
+                reason = ("unknown_owner" if not machines else "multiple_machines" if len(machines) > 1 else
+                          "foreign_machine" if machines != {config["machine"]} else
+                          "foreign_collector" if set(owner["collectors"]) - {config["collector_id"]} or owner["active_collector"] not in (None, config["collector_id"]) else
+                          "foreign_machine" if owner["active_machine"] not in (None, config["machine"]) else None)
+                if reason:
+                    row.update(status="blocked", reason=reason)
+                elif history.get(row["session"], 0) > since_ms:
+                    row.update(status="blocked", reason="history_window_already_limited")
+                elif owner["active_collector"] == config["collector_id"] and owner["active_machine"] == config["machine"]:
+                    row.update(status="skipped", reason="already_active")
+                elif (owner["active_collector"] is None) != (owner["active_machine"] is None):
+                    row.update(status="blocked", reason="ambiguous_active_owner")
+                elif row["session"] in adopted:
+                    row.update(status="skipped", reason="already_adopted")
+                elif owner["before_since"]:
+                    row.update(status="blocked", reason="server_history_before_since")
+                else:
+                    row.update(status="safe", reason=None)
+        except DeliveryError as exc:
+            result["last_error"] = str(exc)
+            for row in rows:
+                if row["status"] == "pending":
+                    row.update(status="blocked", reason="inspection_failed")
+            return result
+        finally:
+            probe.close()
+    if not apply:
+        return result
+    state_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    backup_state(state_dir)
+    safe = {r["session"] for r in rows if r["status"] == "safe"}
+    config["adopt_sessions"] = sorted(adopted | safe)
+    config["history_since"] = {**history, **{s: since_ms for s in safe - adopted}}
+    write_config(config_path, config)
+    collector = Collector(config, state_dir)
+    try:
+        established = {r[0] for r in collector.db.execute("SELECT session FROM files WHERE eligible=1")}
+        for row in rows:
+            if row["status"] == "blocked" or row["session"] not in safe | adopted | established:
+                continue
+            for path in candidates[row["session"]]:
+                collector._scan_file(path, str(path.resolve()))
+        with collector.db:
+            collector._set("scanned_at_ms", now_ms())
+        result.update(collector.sync(), applied=True)
+    finally:
+        collector.close()
+    return result
+
+
 def install(state_dir, codex_home, machine=None, endpoint=None, token=None,
-            adopt_sessions=(), autostart=True, proxy=None):
+            adopt_sessions=(), autostart=True, proxy=None, backfill_since=None):
     import tomllib
     state_dir, codex_home = Path(state_dir).resolve(), Path(codex_home).resolve()
     state_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -473,23 +673,72 @@ def install(state_dir, codex_home, machine=None, endpoint=None, token=None,
     validate_config(config)
     if previous and (config["machine"] != previous["machine"] or str(codex_home) != previous["codex_home"]):
         raise ValueError("install_identity_change_requires_new_state_directory")
-    temporary = config_path.with_suffix(".tmp")
-    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
-        stream.write(compact(config))
-        stream.flush()
-        os.fsync(stream.fileno())
-    os.replace(temporary, config_path)
-    os.chmod(config_path, 0o600)
+    if backfill_since:
+        history_cutoff(backfill_since)
     installed_script = state_dir / "codex_usage.py"
-    if Path(__file__).resolve() != installed_script:
-        shutil.copyfile(__file__, installed_script)
-    startup = install_startup(state_dir, installed_script, config["collector_id"]) if autostart else "disabled"
-    return dict(machine=config["machine"], collector_id=config["collector_id"],
-                baseline_ms=config["baseline_ms"], adopted_sessions=len(config["adopt_sessions"]), autostart=startup)
+    stopped = installed_script.exists() and bool(autostart or backfill_since)
+    if stopped:
+        stop_startup(config["collector_id"])
+    startup = "disabled"
+    try:
+        if Path(__file__).resolve() != installed_script:
+            temporary_script = installed_script.with_suffix(".tmp")
+            try:
+                shutil.copyfile(__file__, temporary_script)
+                os.replace(temporary_script, installed_script)
+            finally:
+                temporary_script.unlink(missing_ok=True)
+        history_result = backfill(state_dir, backfill_since, apply=True, config=config) if backfill_since else None
+        if history_result is not None:
+            if not history_result["applied"]:
+                backup_state(state_dir)
+                write_config(config_path, config)
+            else:
+                config = read_config(config_path)
+        else:
+            write_config(config_path, config)
+    finally:
+        if autostart and config_path.exists() and installed_script.exists():
+            startup = install_startup(state_dir, installed_script, config["collector_id"], stop_existing=not stopped)
+    result = dict(machine=config["machine"], collector_id=config["collector_id"],
+                  baseline_ms=config["baseline_ms"], adopted_sessions=len(config["adopt_sessions"]), autostart=startup)
+    if history_result is not None:
+        result.update(backfill=history_result, last_error=history_result["last_error"])
+    return result
 
 
-def install_startup(state_dir, script, collector_id):
+def windows_stop_command(name):
+    name = "'" + name.replace("'", "''") + "'"
+    return (f"$existing=Get-ScheduledTask -TaskPath '\\' -ErrorAction Stop | Where-Object TaskName -eq {name};"
+            "if($existing){Stop-ScheduledTask -InputObject $existing -ErrorAction Stop;"
+            "$deadline=(Get-Date).AddSeconds(30);"
+            "do{Start-Sleep -Milliseconds 100;"
+            f"$running=(Get-ScheduledTask -TaskName {name} -ErrorAction Stop).State -eq 'Running';"
+            "}while($running -and (Get-Date) -lt $deadline);"
+            "if($running){throw 'sender_stop_timeout';}}")
+
+
+def stop_startup(collector_id):
+    """Stop the registered sender before changing its code or adoption scope."""
+    name = "codex-usage-" + collector_id[:8]
+    if sys.platform == "win32":
+        import base64
+        command = "$ErrorActionPreference='Stop';" + windows_stop_command(name)
+        subprocess.run(["powershell.exe", "-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-EncodedCommand", base64.b64encode(command.encode("utf-16le")).decode()],
+                       check=True, capture_output=True, creationflags=subprocess.CREATE_NO_WINDOW)
+    elif sys.platform == "darwin":
+        label = "local." + name
+        jobs = subprocess.run(["launchctl", "list"], check=True, capture_output=True, text=True)
+        if any(line.split()[-1:] == [label] for line in jobs.stdout.splitlines()):
+            subprocess.run(["launchctl", "bootout", "gui/" + str(os.getuid()) + "/" + label], check=True, capture_output=True)
+    else:
+        unit = name + ".service"
+        loaded = subprocess.run(["systemctl", "--user", "show", unit, "--property=LoadState", "--value"], check=True, capture_output=True, text=True)
+        if loaded.stdout.strip() != "not-found":
+            subprocess.run(["systemctl", "--user", "stop", unit], check=True, capture_output=True)
+
+
+def install_startup(state_dir, script, collector_id, stop_existing=True):
     name = "codex-usage-" + collector_id[:8]
     python = Path(sys.executable)
     if sys.platform == "win32":
@@ -498,6 +747,7 @@ def install_startup(state_dir, script, collector_id):
             python = python.with_name("pythonw.exe")
         quote = lambda value: "'" + str(value).replace("'", "''") + "'"
         arguments = subprocess.list2cmdline([str(script), "run", "--state-dir", str(state_dir)])
+        stop = windows_stop_command(name) if stop_existing else ""
         command = (
             "$ErrorActionPreference='Stop';"
             "$u=[System.Security.Principal.WindowsIdentity]::GetCurrent().Name;"
@@ -505,8 +755,7 @@ def install_startup(state_dir, script, collector_id):
             "$t=New-ScheduledTaskTrigger -AtLogOn -User $u;"
             "$p=New-ScheduledTaskPrincipal -UserId $u -LogonType Interactive -RunLevel Limited;"
             "$s=New-ScheduledTaskSettingsSet -Hidden -MultipleInstances IgnoreNew -ExecutionTimeLimit ([TimeSpan]::Zero) -StartWhenAvailable -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1);"
-            f"$existing=Get-ScheduledTask -TaskPath '\\' -ErrorAction Stop | Where-Object TaskName -eq {quote(name)};"
-            "if($existing){Stop-ScheduledTask -InputObject $existing -ErrorAction Stop;}"
+            f"{stop}"
             f"Register-ScheduledTask -TaskName {quote(name)} -Action $a -Trigger $t -Principal $p -Settings $s -Force | Out-Null;"
             f"Start-ScheduledTask -TaskName {quote(name)}"
         )
@@ -536,7 +785,7 @@ def main(argv=None):
     home = Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex")))
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
-    for command in ("install", "run", "once", "status", "doctor"):
+    for command in ("install", "backfill", "run", "once", "status", "doctor"):
         sub = commands.add_parser(command)
         sub.add_argument("--state-dir", type=Path, default=home / "usage-sender")
         if command == "install":
@@ -545,7 +794,11 @@ def main(argv=None):
             sub.add_argument("--endpoint")
             sub.add_argument("--proxy")
             sub.add_argument("--adopt-session", action="append", default=[])
+            sub.add_argument("--backfill-since")
             sub.add_argument("--no-autostart", action="store_true")
+        elif command == "backfill":
+            sub.add_argument("--since", required=True)
+            sub.add_argument("--apply", action="store_true")
         elif command == "run":
             sub.add_argument("--interval", type=float, default=30)
     args = parser.parse_args(argv)
@@ -555,7 +808,10 @@ def main(argv=None):
             if sys.version_info < (3, 11):
                 raise ValueError("client_requires_python_3_11")
             result = install(args.state_dir, args.codex_home, args.machine, args.endpoint,
-                             adopt_sessions=args.adopt_session, autostart=not args.no_autostart, proxy=args.proxy)
+                             adopt_sessions=args.adopt_session, autostart=not args.no_autostart, proxy=args.proxy,
+                             backfill_since=args.backfill_since)
+        elif args.command == "backfill":
+            result = backfill(args.state_dir, args.since, apply=args.apply)
         else:
             collector = Collector(read_config(args.state_dir / "config.json"), args.state_dir)
             if args.command == "run":

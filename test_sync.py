@@ -123,6 +123,58 @@ class SyncTests(unittest.TestCase):
             self.store.sync(message("activate", sessions=["conversation-1", "other-session"]))
         self.assertEqual(self.store.connection.execute("SELECT COUNT(*) FROM journal_sessions").fetchone()[0], 0)
 
+    def test_history_inspection_is_read_only_and_distinguishes_raw_owners(self):
+        self.store.ingest(batch())
+        self.store.sync(message("events", events=[event(), event("resp-2")]))
+        self.store.sync(message("activate", sessions=["conversation-1"]))
+        # A copied OTLP session stays hidden but must still block automatic adoption.
+        self.store.ingest(batch(env="other-host"))
+        before = list(self.store.connection.iterdump())
+        result = self.store.sync({**message("inspect", sessions=["conversation-1", "unknown"], since_ms=0),
+                                  "collector_id": "new-collector"})
+        self.assertEqual(result["sessions"], [
+            dict(session="conversation-1", machines=["mac-a", "other-host"], collectors=["collector-a"],
+                 active_collector="collector-a", active_machine="mac-a", before_since=False,
+                 events=2, total_tokens=220),
+            dict(session="unknown", machines=[], collectors=[], active_collector=None,
+                 active_machine=None, before_since=False, events=0, total_tokens=0)])
+        self.assertEqual(list(self.store.connection.iterdump()), before)
+
+    def test_history_inspection_counts_visible_window_and_detects_earlier_rows(self):
+        self.store.ingest(batch())
+        self.store.ingest(batch(**{"event.timestamp": "2026-09-04T13:31:28.075Z"}))
+        self.store.sync(message("events", events=[event()]))  # Not activated: excluded from visible totals.
+        info = self.store.sync(message("inspect", sessions=["conversation-1"], since_ms=1788566400000))["sessions"][0]
+        self.assertTrue(info["before_since"])
+        self.assertEqual(info["events"], 1)
+        self.assertEqual(info["total_tokens"], self.store.snapshot()["events"][-1]["total_tokens"])
+        self.assertEqual(info["collectors"], ["collector-a"])
+
+    def test_history_cutoff_prevents_hiding_earlier_usage_and_rolls_back_batch(self):
+        self.store.ingest(batch(**{"event.timestamp": "2026-09-04T13:31:28.075Z"}))
+        other = {**event("resp-other"), "session": "other-session"}
+        self.store.sync(message("events", events=[event(), other]))
+        with self.assertRaisesRegex(ValueError, "predates"):
+            self.store.sync(message("activate", sessions=["other-session", "conversation-1"], since_ms=1788566400000))
+        self.assertEqual(self.store.connection.execute("SELECT COUNT(*) FROM journal_sessions").fetchone()[0], 0)
+        self.assertEqual(len(self.store.snapshot()["events"]), 1)
+        self.store.sync(message("activate", sessions=["other-session"], since_ms=1788566400000))
+        # The existing whole-history protocol remains valid.
+        self.store.sync(message("activate", sessions=["conversation-1"]))
+        self.assertEqual(len(self.store.snapshot()["events"]), 2)
+
+    def test_history_requests_validate_cutoff_and_session_list_without_writes(self):
+        self.store.sync(message("events", events=[event(), {**event("resp-x"), "session": "x"}]))
+        before = list(self.store.connection.iterdump())
+        for action in ("inspect", "activate"):
+            for cutoff in (-1, True, "0", None, 2**53):
+                with self.subTest(action=action, cutoff=cutoff), self.assertRaises(ValueError):
+                    self.store.sync(message(action, sessions=["conversation-1"], since_ms=cutoff))
+            for sessions in ([], ["x"] * 201, ["x", "x"], [None]):
+                with self.subTest(action=action, sessions=sessions), self.assertRaises(ValueError):
+                    self.store.sync(message(action, sessions=sessions, since_ms=0))
+        self.assertEqual(list(self.store.connection.iterdump()), before)
+
     def test_database_failure_returns_no_ack(self):
         self.store.connection.execute("CREATE TRIGGER disk_failure BEFORE INSERT ON usage BEGIN SELECT RAISE(ABORT,'disk failure'); END")
         import sqlite3
@@ -132,6 +184,50 @@ class SyncTests(unittest.TestCase):
 
 
 class SyncHTTPTests(unittest.TestCase):
+    def test_historical_backfill_with_real_receiver_preserves_foreign_usage(self):
+        from codex_usage import backfill, timestamp_ms
+        from test_codex_usage import journal
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "sessions").mkdir()
+            state = root / "state"
+            state.mkdir()
+            own = journal("own", created="2026-09-01T00:00:00Z")
+            own.append({**own[-1], "timestamp": "2026-09-17T00:00:02Z",
+                        "payload": {**own[-1]["payload"], "response_id": "resp-2"}})
+            foreign = journal("foreign", created="2026-09-01T00:00:00Z", response="resp-foreign")
+            for name, rows in (("own", own), ("foreign", foreign)):
+                (root / "sessions" / (name + ".jsonl")).write_text("".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
+            http = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+            http.store = Store(":memory:")
+            http.ingest_token = "x" * 40
+            for session, machine in (("own", "test-machine"), ("foreign", "other-machine")):
+                http.store.ingest(batch(env=machine, **{"conversation.id": session}))
+            config = dict(codex_home=str(root), machine="test-machine", collector_id="collector-1",
+                          baseline_ms=timestamp_ms("2026-09-18T00:00:00Z"),
+                          endpoint=f"http://127.0.0.1:{http.server_port}/v1/usage", token=http.ingest_token, timeout=3)
+            (state / "config.json").write_text(json.dumps(config), encoding="utf-8")
+            worker = threading.Thread(target=http.serve_forever, daemon=True)
+            worker.start()
+            try:
+                before = list(http.store.connection.iterdump())
+                backfill(state, "2026-09-05")
+                self.assertEqual(list(http.store.connection.iterdump()), before)
+                self.assertFalse((state / "ledger.sqlite").exists())
+                backfill(state, "2026-09-05", apply=True)
+                visible = http.store.snapshot()["events"]
+                self.assertEqual(len(visible), 3)
+                self.assertEqual(sum(e["total_tokens"] for e in visible if e["machine"] == "test-machine"), 240)
+                self.assertEqual(http.store.connection.execute("SELECT COUNT(*) FROM usage").fetchone()[0], 4)
+                self.assertEqual(http.store.connection.execute("SELECT session FROM journal_sessions").fetchall(), [("own",)])
+                backfill(state, "2026-09-05", apply=True)
+                self.assertEqual(http.store.snapshot()["events"], visible)
+            finally:
+                http.shutdown()
+                http.server_close()
+                worker.join()
+                http.store.connection.close()
+
     def test_real_sender_recovers_lost_ack_and_empty_server_restore(self):
         from codex_usage import Collector
         from test_codex_usage import journal

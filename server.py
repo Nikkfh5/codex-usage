@@ -164,12 +164,35 @@ class Store:
             raise ValueError("unsupported protocol")
         machine, collector = sync_label(payload.get("machine")), sync_label(payload.get("collector_id"))
         action = payload.get("action")
+        if action in ("inspect", "activate"):
+            sessions, since = payload.get("sessions"), payload.get("since_ms", 0)
+            if not isinstance(sessions, list) or not 1 <= len(sessions) <= 200:
+                raise ValueError("invalid sessions")
+            sessions = [sync_label(session) for session in sessions]
+            if len(set(sessions)) != len(sessions):
+                raise ValueError("duplicate session")
+            if type(since) is not int or not 0 <= since <= 2**53 - 1:
+                raise ValueError("invalid history cutoff")
         now = int(time.time() * 1000)
         result = {"version": 1}
         with LOCK, self.connection:
             owner = self.connection.execute("SELECT machine FROM journal_collectors WHERE collector_id=?", (collector,)).fetchone()
             if owner and owner[0] != machine:
                 raise SyncConflict("collector identity conflict")
+            if action == "inspect":
+                result["sessions"] = []
+                for session in sessions:
+                    rows = [json.loads(row[0]) for row in self.connection.execute("SELECT body FROM usage WHERE json_extract(body,'$.session')=?", (session,))]
+                    active = self.connection.execute("SELECT machine,collector_id FROM journal_sessions WHERE session=?", (session,)).fetchone()
+                    visible = self.connection.execute("SELECT COUNT(*),COALESCE(SUM(json_extract(body,'$.total_tokens')),0) FROM visible_usage WHERE json_extract(body,'$.session')=? AND timestamp_ms>=?", (session, since)).fetchone()
+                    result["sessions"].append(dict(session=session,
+                        machines=sorted({row["machine"] for row in rows}),
+                        collectors=sorted({row["collector_id"] for row in rows if row.get("source") == "journal"}),
+                        active_machine=active[0] if active else None,
+                        active_collector=active[1] if active else None,
+                        before_since=any(row["timestamp_ms"] < since for row in rows),
+                        events=visible[0], total_tokens=visible[1]))
+                return result  # Read-only: inspection must not register a collector or refresh activity.
             self.connection.execute("INSERT INTO journal_collectors VALUES (?,?,?,?) ON CONFLICT(collector_id) DO UPDATE SET received_ms=excluded.received_ms", (collector, machine, now, '{}'))
             if action == "events":
                 events = payload.get("events")
@@ -221,17 +244,15 @@ class Store:
                 clean_status["reported_at_ms"] = now
                 self.connection.execute("UPDATE journal_collectors SET status=? WHERE collector_id=?", (json.dumps(clean_status), collector))
             elif action == "activate":
-                sessions = payload.get("sessions")
-                if not isinstance(sessions, list) or not 1 <= len(sessions) <= 200:
-                    raise ValueError("invalid sessions")
                 for session in sessions:
-                    sync_label(session)
                     rows = [json.loads(row[0]) for row in self.connection.execute("SELECT body FROM usage WHERE json_extract(body,'$.session')=?", (session,))]
                     own = [row for row in rows if row.get("source") == "journal" and row.get("collector_id") == collector]
                     if not own:
                         raise ValueError("session has no journal records")
                     if any(row["machine"] != machine or (row.get("source") == "journal" and row.get("collector_id") != collector) for row in rows):
                         raise SyncConflict("session history conflict")
+                    if any(row["timestamp_ms"] < since for row in rows):
+                        raise SyncConflict("session history predates cutoff")
                     previous = self.connection.execute("SELECT collector_id FROM journal_sessions WHERE session=?", (session,)).fetchone()
                     if previous and previous[0] != collector:
                         raise SyncConflict("session ownership conflict")

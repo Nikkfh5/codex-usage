@@ -50,3 +50,33 @@ Canonical output adds stable `id=sha256('journal:'+response_id)`, `source='journ
 `event_timestamp`, `host=machine`, `client='codex_journal'`, `tool_tokens=null`.
 Digest: SHA-256 of sorted compact JSON of canonical event, UTF-8.
 Daily digest: SHA-256 of sorted `response_id:event_digest\n` lines for UTC date.
+
+## Historical onboarding extension — 2026-09-17
+
+User requested automatic recovery starting 2026-09-05 before installation.
+Reuse the existing ledger, parser, ACK delivery and whole-session activation.
+
+- [x] `backfill --since YYYY-MM-DD` produces a local/server comparison without sending usage.
+  `--apply` adopts and synchronizes only complete journals owned by this machine.
+  `install --backfill-since YYYY-MM-DD` runs the same step before autostart.
+- [x] Read-only authenticated `inspect` sync action returns session owners/collectors,
+  active owner, visible totals in the requested window and whether earlier server history exists.
+  Unknown/multiple/foreign ownership and competing collectors remain explicitly blocked.
+- [x] Reuse the parser in temporary state. Never derive ownership from rewritten cwd.
+  For adopted history, per-session `history_since` permits ignoring unsupported prefixes
+  before the requested UTC date; do not upload earlier counters. Activation carries
+  `since_ms` and rejects any existing server history before that date.
+- [x] Dry-run leaves the production ledger/config/server totals unchanged. Apply backs up
+  local state, persists adoption atomically, and uses normal retry/deduplication.
+  Return structured reasons for exclusions so an agent can resolve provenance separately.
+- [x] Tests: copied/unknown owners, old session active after cutoff, legacy prefix before vs
+  after cutoff, pre-cutoff server history, failed inspect, repeated apply, lost ACK and installer integration.
+- [ ] Document exact human command and agent workflow; verify available ASUS history,
+  deploy a new immutable release, update the installed sender, commit and push.
+
+Wire: `inspect` envelope has `sessions` (1..200 IDs), `since_ms` (UTC cutoff integer).
+Return `{version:1,sessions:[{session,machines,collectors,active_collector,
+active_machine,before_since,events,total_tokens}]}`. No registration/activity mutation.
+`activate` gains optional `since_ms` (default 0), applied to every ID in that batch.
+Client config `history_since` maps explicitly adopted session IDs to UTC milliseconds;
+existing adoptions default to 0 and retain their established parsing scope.
