@@ -436,16 +436,19 @@ class SenderTests(unittest.TestCase):
 
     @unittest.skipIf(sys.version_info < (3, 11), "installer requires Python 3.11 tomllib")
     def test_install_infers_config_preserves_identity_baseline_and_hides_secret(self):
-        (self.home / "config.toml").write_text('[otel]\nenvironment="test-machine"\n[otel.exporter.otlp-http]\nendpoint="https://example.test/v1/logs"\n[otel.exporter.otlp-http.headers]\nAuthorization="Bearer sentinel-secret"\n', encoding="utf-8")
+        native_endpoint = self.config["endpoint"].replace("/v1/usage", "/v1/logs")
+        (self.home / "config.toml").write_text('[otel]\nenvironment="test-machine"\n[otel.exporter.otlp-http]\nendpoint="' + native_endpoint + '"\n[otel.exporter.otlp-http.headers]\nAuthorization="Bearer sentinel-secret"\n', encoding="utf-8")
         target = self.root / "installed"
-        first = usage.install(target, self.home, autostart=False)
-        second = usage.install(target, self.home, autostart=False, adopt_sessions=["session-old"])
+        with mock.patch.object(usage, "stop_startup"):
+            first = usage.install(target, self.home, autostart=False, backfill_since="2026-09-07")
+            second = usage.install(target, self.home, autostart=False, adopt_sessions=["session-old"])
         self.assertEqual(first["collector_id"], second["collector_id"])
         self.assertEqual(first["baseline_ms"], second["baseline_ms"])
         config = json.loads((target / "config.json").read_text())
-        self.assertEqual(config["endpoint"], "https://example.test/v1/usage")
+        self.assertEqual(config["endpoint"], self.config["endpoint"])
         self.assertEqual(config["token"], "sentinel-secret")
         self.assertEqual(config["adopt_sessions"], ["session-old"])
+        self.assertEqual(config["backfill_since"], "2026-09-07")
         self.assertNotIn("sentinel-secret", json.dumps(second))
 
     def test_windows_update_stops_existing_task_before_hidden_restart(self):
@@ -589,15 +592,81 @@ class SenderTests(unittest.TestCase):
             self.assertEqual(collector, self.config["collector_id"])
             return "test_startup"
         with mock.patch.object(usage, "install_startup", side_effect=startup):
-            result = usage.install(self.root / "state", self.home, backfill_since="2026-09-05")
+            result = usage.install(self.root / "state", self.home)
         config = usage.read_config(self.root / "state" / "config.json")
         for key in ("collector_id", "baseline_ms", "token", "machine"):
             self.assertEqual(config[key], self.config[key])
         self.assertEqual(result["autostart"], "test_startup")
+        self.assertEqual(config["backfill_since"], "2026-09-05")
+        self.assertFalse(result["backfill_pending"])
         self.assertNotIn("sentinel-secret", json.dumps(result))
         with mock.patch.object(usage, "backfill", return_value={"applied": False}) as backfill, contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(usage.main(["backfill", "--state-dir", str(self.root / "state"), "--since", "2026-09-05"]), 0)
         self.assertEqual(backfill.call_args.args[:2], (self.root / "state", "2026-09-05"))
+
+    def test_default_install_retries_history_after_restart_without_blocking_new_usage(self):
+        self.prepare_history()
+        target = self.root / "state"
+        self.state["action_status"] = {"inspect": 500}
+        with mock.patch.object(usage, "install_startup", return_value="test_startup"):
+            result = usage.install(target, self.home)
+        self.assertTrue(result["backfill_pending"])
+        self.assertEqual(result["last_error"], "HTTP_500")
+        self.sender.close()
+        self.write(journal(response="new-response"), name="new.jsonl")
+        config = usage.read_config(target / "config.json")
+        with contextlib.closing(usage.Collector(config, target)) as restarted:
+            failed = restarted.once()
+            self.assertTrue(failed["backfill_pending"])
+            self.assertEqual(failed["backfill_error"], "HTTP_500")
+            self.assertEqual(set(self.state["events"]), {"new-response"})
+        self.state["action_status"].clear()
+        with contextlib.closing(usage.Collector(config, target)) as restarted:
+            recovered = restarted.once()
+            self.assertFalse(recovered["backfill_pending"])
+            self.assertIsNone(recovered["last_error"])
+            self.assertEqual(set(self.state["events"]), {"new-response", "resp-1"})
+            count = sum(r["action"] == "inspect" for r in self.state["requests"])
+            restarted.once()
+            self.assertEqual(sum(r["action"] == "inspect" for r in self.state["requests"]), count)
+        report = usage.read_config(target / "backfill-report.json")
+        self.assertTrue(report["applied"])
+        self.assertFalse(report["backfill_pending"])
+        self.assertNotIn("sentinel-secret", json.dumps(report))
+        self.assertTrue(any(s["session"] == "session-old" and s["status"] == "safe" for s in report["sessions"]))
+
+    def test_history_retry_can_recover_owned_usage_despite_an_unrelated_bad_file(self):
+        self.prepare_history()
+        target = self.root / "state"
+        self.state["action_status"] = {"inspect": 500}
+        with mock.patch.object(usage, "install_startup", return_value="test_startup"):
+            usage.install(target, self.home)
+        broken = self.write(journal(session="broken")[:2], name="broken.jsonl")
+        with broken.open("a", encoding="utf-8") as stream:
+            stream.write("invalid JSON\n")
+        self.state["action_status"].clear()
+        with contextlib.closing(usage.Collector(usage.read_config(target / "config.json"), target)) as restarted:
+            result = restarted.once()
+            self.assertEqual(set(self.state["events"]), {"resp-1"})
+            self.assertFalse(result["backfill_pending"])
+            self.assertEqual(result["last_error"], "parse_error")
+            self.assertIsNone(result["backfill_error"])
+            self.assertEqual(result["backfill_excluded_sessions"], 1)
+            count = sum(r["action"] == "inspect" for r in self.state["requests"])
+            restarted.once()
+            self.assertEqual(sum(r["action"] == "inspect" for r in self.state["requests"]), count)
+
+    def test_failed_same_date_reinstall_remains_pending_after_prior_success(self):
+        self.prepare_history()
+        target = self.root / "state"
+        with mock.patch.object(usage, "install_startup", return_value="test_startup"), mock.patch.object(usage, "stop_startup"):
+            self.assertFalse(usage.install(target, self.home)["backfill_pending"])
+            with mock.patch.object(usage, "backfill", side_effect=OSError("interrupted_history")):
+                with self.assertRaises(OSError):
+                    usage.install(target, self.home)
+        with contextlib.closing(usage.Collector(usage.read_config(target / "config.json"), target)) as restarted:
+            self.assertTrue(restarted.status()["backfill_pending"])
+            self.assertFalse(restarted.once()["backfill_pending"])
 
     def test_install_stops_old_sender_and_restores_autostart_after_failed_inspection(self):
         self.prepare_history()
@@ -646,7 +715,11 @@ class SenderTests(unittest.TestCase):
                 usage.install(target, self.home, backfill_since="2026-09-05")
         stop.assert_called_once()
         start.assert_called_once()
-        self.assertEqual(before, (target / "config.json").read_bytes())
+        saved = usage.read_config(target / "config.json")
+        self.assertEqual(saved["backfill_since"], "2026-09-05")
+        for key in ("collector_id", "baseline_ms", "adopt_sessions", "history_since", "token"):
+            self.assertEqual(saved.get(key), json.loads(before).get(key))
+        self.assertTrue(any(p.read_bytes() == before for p in target.glob("config.backup-*.json")))
         script.write_text("old sender")
         def failed_copy(source, destination):
             Path(destination).write_text("truncated")

@@ -30,6 +30,7 @@ TOKEN_KEYS = ("input_tokens", "cached_input_tokens", "cache_write_input_tokens",
               "output_tokens", "reasoning_output_tokens", "total_tokens")
 TEXT_KEYS = ("response_id", "machine", "collector_id", "session", "model",
              "client_version", "effort", "service_tier")
+DEFAULT_BACKFILL_SINCE = "2026-09-05"
 
 
 def compact(value):
@@ -127,6 +128,8 @@ def validate_config(config):
     history = config.get("history_since", {})
     if not isinstance(history, dict) or any(s not in adopted or type(value) is not int or not 0 <= value <= 9007199254740991 for s, value in history.items()):
         raise ValueError("invalid_history_since")
+    if "backfill_since" in config:
+        history_cutoff(config["backfill_since"])
     validate_endpoint(config["endpoint"])
 
 
@@ -194,6 +197,15 @@ class Collector:
         if runtime_error.exists():
             code = runtime_error.read_text(encoding="utf-8")
             result["last_error"] = code if code in ("storage_error", "runtime_io_error", "configuration_error") else "runtime_error"
+        if self.config.get("backfill_since"):
+            history = json.loads(self._get("backfill_state", "{}"))
+            same_window = history.get("since") == self.config["backfill_since"]
+            report = self.state_dir / "backfill-report.json"
+            result.update(backfill_since=self.config["backfill_since"],
+                          backfill_pending=not same_window or history.get("pending", True),
+                          backfill_error=history.get("last_error") if same_window else None,
+                          backfill_excluded_sessions=history.get("excluded_sessions", 0) if same_window else 0,
+                          backfill_report=str(report) if report.exists() else None)
         return result
 
     def _eligible(self, session, created_ms):
@@ -447,7 +459,13 @@ class Collector:
             self.config = config
         (self.state_dir / "runtime-error.txt").unlink(missing_ok=True)
         self.scan()
-        return self.sync()
+        result = self.sync()
+        if result.get("backfill_pending") and not self._get("delivery_error"):
+            restore_install_history(self.state_dir, self.config)
+            self.config = read_config(config_path)
+            result = self.status()
+            result["last_error"] = result["last_error"] or result["backfill_error"]
+        return result
 
 
 def read_config(path):
@@ -467,7 +485,7 @@ def write_config(path, config):
 
 
 def history_cutoff(since):
-    if dt.date.fromisoformat(since).isoformat() != since:
+    if not isinstance(since, str) or dt.date.fromisoformat(since).isoformat() != since:
         raise ValueError("invalid_since")
     since_ms = timestamp_ms(since + "T00:00:00Z")
     if since_ms < 0:
@@ -637,6 +655,27 @@ def backfill(state_dir, since, apply=False, config=None):
     return result
 
 
+def restore_install_history(state_dir, config):
+    """Persist the initial history task and its report across sender restarts."""
+    with contextlib.closing(Collector(config, state_dir)) as collector:
+        state = dict(since=config["backfill_since"], pending=True)
+        with collector.db:
+            collector._set("backfill_state", compact(state))
+        result = backfill(state_dir, config["backfill_since"], apply=True, config=config)
+        error = (collector._get("delivery_error") or None) if result["applied"] else result["last_error"]
+        state.update(pending=not result["applied"] or bool(error), last_error=error,
+                     excluded_sessions=sum(r["status"] == "blocked" and r.get("reason") != "no_usage_in_window"
+                                           for r in result["sessions"]))
+        report = Path(state_dir) / "backfill-report.json"
+        result.update(backfill_since=state["since"], backfill_pending=state["pending"],
+                      backfill_error=state["last_error"], backfill_excluded_sessions=state["excluded_sessions"],
+                      backfill_report=str(report))
+        write_config(report, result)
+        with collector.db:
+            collector._set("backfill_state", compact(state))
+    return result
+
+
 def install(state_dir, codex_home, machine=None, endpoint=None, token=None,
             adopt_sessions=(), autostart=True, proxy=None, backfill_since=None):
     import tomllib
@@ -662,6 +701,7 @@ def install(state_dir, codex_home, machine=None, endpoint=None, token=None,
                   token=token or os.environ.get("CODEX_USAGE_TOKEN") or previous.get("token") or inferred_token,
                   collector_id=previous.get("collector_id") or str(uuid.uuid4()),
                   baseline_ms=previous.get("baseline_ms", now_ms()),
+                  backfill_since=backfill_since if backfill_since is not None else previous.get("backfill_since", DEFAULT_BACKFILL_SINCE),
                   adopt_sessions=sorted(set(previous.get("adopt_sessions", [])).union(adopt_sessions)),
                   proxy=proxy if proxy is not None else previous.get("proxy"), timeout=15)
     if not config["machine"] or not config["endpoint"]:
@@ -673,10 +713,8 @@ def install(state_dir, codex_home, machine=None, endpoint=None, token=None,
     validate_config(config)
     if previous and (config["machine"] != previous["machine"] or str(codex_home) != previous["codex_home"]):
         raise ValueError("install_identity_change_requires_new_state_directory")
-    if backfill_since:
-        history_cutoff(backfill_since)
     installed_script = state_dir / "codex_usage.py"
-    stopped = installed_script.exists() and bool(autostart or backfill_since)
+    stopped = installed_script.exists()
     if stopped:
         stop_startup(config["collector_id"])
     startup = "disabled"
@@ -688,22 +726,17 @@ def install(state_dir, codex_home, machine=None, endpoint=None, token=None,
                 os.replace(temporary_script, installed_script)
             finally:
                 temporary_script.unlink(missing_ok=True)
-        history_result = backfill(state_dir, backfill_since, apply=True, config=config) if backfill_since else None
-        if history_result is not None:
-            if not history_result["applied"]:
-                backup_state(state_dir)
-                write_config(config_path, config)
-            else:
-                config = read_config(config_path)
-        else:
-            write_config(config_path, config)
+        backup_state(state_dir)
+        write_config(config_path, config)
+        history_result = restore_install_history(state_dir, config)
+        config = read_config(config_path)
     finally:
         if autostart and config_path.exists() and installed_script.exists():
             startup = install_startup(state_dir, installed_script, config["collector_id"], stop_existing=not stopped)
     result = dict(machine=config["machine"], collector_id=config["collector_id"],
                   baseline_ms=config["baseline_ms"], adopted_sessions=len(config["adopt_sessions"]), autostart=startup)
-    if history_result is not None:
-        result.update(backfill=history_result, last_error=history_result["last_error"])
+    result.update(backfill=history_result, backfill_pending=history_result["backfill_pending"],
+                  last_error=history_result["last_error"])
     return result
 
 
@@ -794,7 +827,7 @@ def main(argv=None):
             sub.add_argument("--endpoint")
             sub.add_argument("--proxy")
             sub.add_argument("--adopt-session", action="append", default=[])
-            sub.add_argument("--backfill-since")
+            sub.add_argument("--backfill-since", help="history start date (default: saved date or 2026-09-05)")
             sub.add_argument("--no-autostart", action="store_true")
         elif command == "backfill":
             sub.add_argument("--since", required=True)
@@ -840,7 +873,7 @@ def main(argv=None):
                                   transport="explicit_proxy" if collector.config.get("proxy") else "direct",
                                   endpoint_scheme=urllib.parse.urlsplit(collector.config["endpoint"]).scheme)
         print(json.dumps(result, indent=2))
-        return 1 if result.get("last_error") else 0
+        return 1 if result.get("last_error") or result.get("backfill_pending") else 0
     except KeyboardInterrupt:
         return 0
     except (OSError, ValueError, sqlite3.Error, subprocess.SubprocessError):

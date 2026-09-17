@@ -86,3 +86,14 @@ Verified: 92 Windows tests, 48 Linux server tests; commit `7cf826e`, release
 For September 5–15 UTC, public CSV matches 8,907 ledger records; visible total
 1,079,242,619 tokens (+141,298,966). All 31,484 original server rows retained.
 33 foreign Mac sessions and 6 unknown-owner sessions remain explicitly excluded.
+
+## Mandatory initial recovery — 2026-09-17
+
+Plain `install` now selects 2026-09-05 by default, preserving an explicitly saved date.
+The task is persisted before recovery and retried by the existing sender after transport
+recovers, including after restart. A completed check is not repeated on every scan.
+`status`/`doctor` expose pending state, history errors, exclusion count and the saved
+`backfill-report.json`. Unrelated file errors do not suppress recovery of valid history.
+Agent onboarding instructions require checking that report and reporting exclusions.
+Verified: 95 Windows tests, including offline install/restart, unrelated broken journal,
+failed same-date reinstall after success, and preserving a custom start date.
