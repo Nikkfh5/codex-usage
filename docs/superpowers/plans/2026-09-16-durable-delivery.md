@@ -71,7 +71,7 @@ Reuse the existing ledger, parser, ACK delivery and whole-session activation.
   Return structured reasons for exclusions so an agent can resolve provenance separately.
 - [x] Tests: copied/unknown owners, old session active after cutoff, legacy prefix before vs
   after cutoff, pre-cutoff server history, failed inspect, repeated apply, lost ACK and installer integration.
-- [ ] Document exact human command and agent workflow; verify available ASUS history,
+- [x] Document exact human command and agent workflow; verify available ASUS history,
   deploy a new immutable release, update the installed sender, commit and push.
 
 Wire: `inspect` envelope has `sessions` (1..200 IDs), `since_ms` (UTC cutoff integer).
@@ -80,3 +80,9 @@ active_machine,before_since,events,total_tokens}]}`. No registration/activity mu
 `activate` gains optional `since_ms` (default 0), applied to every ID in that batch.
 Client config `history_since` maps explicitly adopted session IDs to UTC milliseconds;
 existing adoptions default to 0 and retain their established parsing scope.
+
+Verified: 92 Windows tests, 48 Linux server tests; commit `7cf826e`, release
+`20260917T091549Z-durable`. ASUS adopted 15 additional sessions / 3,264 records.
+For September 5–15 UTC, public CSV matches 8,907 ledger records; visible total
+1,079,242,619 tokens (+141,298,966). All 31,484 original server rows retained.
+33 foreign Mac sessions and 6 unknown-owner sessions remain explicitly excluded.
