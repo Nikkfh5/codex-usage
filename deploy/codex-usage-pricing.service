@@ -1,0 +1,23 @@
+[Unit]
+Description=Проверка новых тарифов Codex через exec
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+StateDirectory=codex-usage/pricing-agent
+WorkingDirectory=/opt/codex-usage/current
+Environment=CODEX_HOME=/root/.codex
+ExecStartPre=/usr/bin/install -d -o codex-usage -g codex-usage -m 700 /var/lib/codex-usage/pricing-agent
+ExecStart=/usr/bin/python3 /opt/codex-usage/current/pricing.py --data-dir /var/lib/codex-usage
+ExecStartPost=/usr/bin/chown -R codex-usage:codex-usage /var/lib/codex-usage/pricing-agent
+TimeoutStartSec=360
+KillMode=control-group
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/var/lib/codex-usage/pricing-agent /root/.codex
+MemoryMax=512M
+TasksMax=128

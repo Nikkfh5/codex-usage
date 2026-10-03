@@ -1,0 +1,10 @@
+[Unit]
+Description=Проверять новые модели в расходе Codex каждые пять минут
+
+[Timer]
+OnBootSec=2min
+OnUnitInactiveSec=5min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

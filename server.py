@@ -235,6 +235,10 @@ class Store:
                 if error is not None and (not isinstance(error, str) or not re.fullmatch(r"[A-Za-z0-9_:-]{1,80}", error)):
                     raise ValueError("invalid error code")
                 clean_status["last_error"] = error
+                if 'auto_repair' in status:
+                    if type(status['auto_repair']) is not bool or status.get('repair_status') not in ('disabled','idle','running','resolved','unresolved','agent_failed','start_failed','needs_login'):
+                        raise ValueError('invalid_repair_status')
+                    clean_status.update(auto_repair=status['auto_repair'],repair_status=status['repair_status'])
                 stored = [json.loads(row[0]) for row in self.connection.execute("SELECT body FROM usage WHERE json_extract(body,'$.collector_id')=? AND json_extract(body,'$.source')='journal'", (collector,))]
                 inventory = {day["day"]: day for day in day_inventory(stored)}
                 result["resend_days"] = sorted(day for day in reported if reported[day] != inventory.get(day))
@@ -312,6 +316,8 @@ class Store:
                 item[field] = item[field] + report[field] if item[field] is not None and field in report else None
             item["active_sessions"] += active_counts.get(collector, 0)
             item["last_error"] = report.get("last_error") or item["last_error"]
+            item['auto_repair'] = item.get('auto_repair',True) and report.get('auto_repair',False)
+            item['repair_status'] = report.get('repair_status','disabled')
         result = []
         for row in rows:
             item = dict(zip(("machine", "host", "client", "version", "first_event_ms", "last_event_ms", "last_received_ms"), row))
@@ -406,6 +412,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.respond(403, b'{}')
         path = urlsplit(self.path).path
         params = parse_qs(urlsplit(self.path).query, keep_blank_values=True)
+        if path.startswith('/api/') and hasattr(self.server,'data_dir'):
+            pricing.load_agent_rates(self.server.data_dir)
         if path == "/api/v1/schema":
             return self.respond(200, json.dumps({
                 "schema_version": analytics.VERSION,
@@ -498,6 +506,7 @@ def main():
     server.ingest_token = token
     server.central = args.central
     server.deployment_label = args.label
+    server.data_dir = args.data_dir
     print(f"Codex usage: http://127.0.0.1:{args.port}", flush=True)
     try:
         server.serve_forever()

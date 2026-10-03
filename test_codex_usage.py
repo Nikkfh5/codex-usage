@@ -323,6 +323,77 @@ class SenderTests(unittest.TestCase):
         self.assertEqual(self.sender.status()["last_error"], "session_conflict")
         self.assertFalse(self.state["events"])
 
+    def test_fork_parent_header_keeps_child_identity_and_own_usage(self):
+        records = journal()
+        records[0]['payload']['forked_from_id'] = 'parent-thread'
+        records.insert(1, journal(session='parent-thread')[0])
+        records[-1]['payload']['thread_id'] = 'session-new'
+        self.write(records)
+        self.sender.once()
+        self.assertIsNone(self.sender.status()['last_error'])
+        self.assertEqual(self.state['events']['resp-1']['session'], 'session-new')
+
+    def test_existing_conflict_cursor_is_reparsed_after_sender_update(self):
+        records = journal()
+        records[0]['payload']['forked_from_id'] = 'parent-thread'
+        records.insert(1, journal(session='parent-thread')[0])
+        path = self.write(records)
+        self.sender.scan()
+        context = json.loads(self.sender.db.execute('SELECT context FROM files').fetchone()[0])
+        context.pop('forked_from_id')
+        prefix = path.read_bytes().splitlines(keepends=True)[0]
+        with self.sender.db:
+            self.sender.db.execute("UPDATE files SET offset=?,prefix_hash=?,context=?,complete=0,error='session_conflict'",
+                (len(prefix),hashlib.sha256(prefix).hexdigest(),json.dumps(context)))
+        self.sender.once()
+        self.assertIsNone(self.sender.status()['last_error'])
+
+    def test_auto_repair_waits_for_persistent_error_and_never_relaunches_same_issue(self):
+        self.sender.config['auto_repair'] = True
+        with mock.patch.object(usage.subprocess,'Popen') as launch:
+            for _ in range(2):
+                self.sender.maybe_repair({'last_error':'file_missing'})
+            launch.assert_not_called()
+            self.sender.maybe_repair({'last_error':'file_missing'})
+            self.assertEqual(launch.call_count,1)
+            self.assertNotIn('sentinel-secret',repr(launch.call_args))
+            self.assertIn('repair',launch.call_args.args[0])
+            for _ in range(5):
+                self.sender.maybe_repair({'last_error':'file_missing'})
+            self.assertEqual(launch.call_count,1)
+
+    def test_auto_repair_is_disabled_for_legacy_config_and_healthy_sender(self):
+        with mock.patch.object(usage.subprocess,'Popen') as launch:
+            self.sender.maybe_repair({'last_error':'file_missing'})
+            self.sender.config['auto_repair'] = True
+            self.sender.maybe_repair({'last_error':None})
+            launch.assert_not_called()
+
+    def test_exec_revoked_login_is_reported_without_raw_diagnostics(self):
+        with mock.patch.object(usage.subprocess,'Popen') as launch:
+            process=launch.return_value.__enter__.return_value
+            process.communicate.return_value=(None,b'refresh_token_invalidated sentinel-secret')
+            process.returncode=1
+            with self.assertRaisesRegex(usage.DeliveryError,'^agent_login_required$'):
+                usage.run_agent(self.root/'agent','READY',command='codex',readonly=True)
+
+
+    def test_unrelated_second_header_is_still_a_conflict(self):
+        records = journal()
+        records[0]['payload']['forked_from_id'] = 'parent-thread'
+        records.insert(1, journal(session='unrelated-thread')[0])
+        self.write(records)
+        self.sender.once()
+        self.assertEqual(self.sender.status()['last_error'], 'session_conflict')
+        self.assertFalse(self.state['events'])
+
+    def test_history_cutoff_accepts_explicit_timezone_not_naive_time(self):
+        self.assertEqual(usage.history_cutoff('2026-10-01T00:00:00+03:00'),
+                         usage.timestamp_ms('2026-09-30T21:00:00Z'))
+        with self.assertRaises(ValueError):
+            usage.history_cutoff('2026-10-01T00:00:00')
+
+
     def test_wire_batch_is_bounded_to_200_events(self):
         records = journal()[:2]
         records.extend(journal(response=f"resp-{i}")[-1] for i in range(405))
