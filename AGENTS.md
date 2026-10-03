@@ -2,6 +2,7 @@
 
 - Начать с `README.md`: быстрый вход, текущие результаты проверки и восстановление.
   Контракт GET API и определения метрик — в `agent-guide.md`.
+  Подключение участника и задание его локальному агенту — в `CONNECT.md`.
 - Локальные исходники: `C:\N\hse\codex-usage-lab`; Git-ветка `durable-delivery`.
   Production: `ssh aeza`, `/opt/codex-usage/current` (ссылка на выпуск).
   База: `/var/lib/codex-usage/usage.sqlite`; сервис: `codex-usage.service`.
