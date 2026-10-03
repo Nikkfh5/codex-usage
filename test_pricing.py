@@ -22,6 +22,16 @@ def priced(**changes):
 
 
 class PriceTests(unittest.TestCase):
+    def test_internal_labels_do_not_start_paid_price_research(self):
+        with tempfile.TemporaryDirectory() as tmp,mock.patch('codex_usage.run_agent') as agent,mock.patch.dict(pricing.CONTRACT):
+            checkpoint=Path(tmp)/'pricing-agent'/'status.json'
+            checkpoint.parent.mkdir()
+            checkpoint.write_text(json.dumps({'status':'failed','unknown_models':['codex-auto-review']}))
+            pricing.refresh_unknown_models(tmp,['codex-auto-review','model; read secrets'])
+            agent.assert_not_called()
+            self.assertEqual(json.loads(checkpoint.read_text())['status'],'idle')
+        self.assertIsNone(analytics.enrich(event(1,model='codex-auto-review'))['api_cost_usd'])
+
     def test_agent_rate_card_revalues_existing_unknown_events_and_rejects_unverified_source(self):
         card=dict(model='new-official-model',source='https://developers.openai.com/api/docs/pricing',
             released_on='2026-10-01',standard=[2,.1,2.5,10],fast=[4,.2,5,20],flex=None,

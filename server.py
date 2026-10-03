@@ -236,7 +236,7 @@ class Store:
                     raise ValueError("invalid error code")
                 clean_status["last_error"] = error
                 if 'auto_repair' in status:
-                    if type(status['auto_repair']) is not bool or status.get('repair_status') not in ('disabled','idle','running','resolved','unresolved','agent_failed','start_failed'):
+                    if type(status['auto_repair']) is not bool or status.get('repair_status') not in ('disabled','idle','running','resolved','unresolved','agent_failed','start_failed','needs_login'):
                         raise ValueError('invalid_repair_status')
                     clean_status.update(auto_repair=status['auto_repair'],repair_status=status['repair_status'])
                 stored = [json.loads(row[0]) for row in self.connection.execute("SELECT body FROM usage WHERE json_extract(body,'$.collector_id')=? AND json_extract(body,'$.source')='journal'", (collector,))]

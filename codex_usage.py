@@ -60,11 +60,13 @@ def run_agent(state_dir, prompt, *, command=None, readonly=False, schema=None):
         schema_path = state_dir / "agent-schema.json"
         write_config(schema_path, schema)
         args.extend(["--output-schema", str(schema_path)])
+    if readonly:
+        args.extend(["-c", "features.shell_tool=false"])
     args.append("-")
     options = dict(creationflags=subprocess.CREATE_NO_WINDOW) if sys.platform == "win32" else dict(start_new_session=True)
-    with subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, **options) as process:
+    with subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, **options) as process:
         try:
-            process.communicate(prompt.encode("utf-8"), timeout=300)
+            _, diagnostics = process.communicate(prompt.encode("utf-8"), timeout=300)
         except subprocess.TimeoutExpired:
             # Kill only this job's process tree, including a tool still running.
             if sys.platform == "win32":
@@ -75,6 +77,8 @@ def run_agent(state_dir, prompt, *, command=None, readonly=False, schema=None):
             process.wait()
             raise DeliveryError("agent_timeout")
         if process.returncode:
+            if b'refresh_token_invalidated' in diagnostics or b'refresh token was revoked' in diagnostics:
+                raise DeliveryError('agent_login_required')
             raise DeliveryError("agent_failed")
     if not output.exists():
         raise DeliveryError("agent_output_missing")
@@ -582,8 +586,8 @@ backfill-report.json и таблицу files в ledger.sqlite. Исходные 
             run_agent(state_dir, prompt, command=config.get("codex_command"))
             result = collector.once()
             outcome = "unresolved" if result.get("last_error") or result.get("backfill_pending") else "resolved"
-        except (DeliveryError, OSError, ValueError, sqlite3.Error):
-            outcome = "agent_failed"
+        except (DeliveryError, OSError, ValueError, sqlite3.Error) as exc:
+            outcome = 'needs_login' if isinstance(exc,DeliveryError) and str(exc)=='agent_login_required' else "agent_failed"
         with collector.db:
             collector._set("repair_status", outcome)
         return collector.status()

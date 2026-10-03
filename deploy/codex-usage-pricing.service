@@ -5,6 +5,7 @@ After=network-online.target
 [Service]
 Type=oneshot
 User=root
+StateDirectory=codex-usage/pricing-agent
 WorkingDirectory=/opt/codex-usage/current
 Environment=CODEX_HOME=/root/.codex
 ExecStartPre=/usr/bin/install -d -o codex-usage -g codex-usage -m 700 /var/lib/codex-usage/pricing-agent

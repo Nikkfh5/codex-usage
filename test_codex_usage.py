@@ -369,6 +369,14 @@ class SenderTests(unittest.TestCase):
             self.sender.maybe_repair({'last_error':None})
             launch.assert_not_called()
 
+    def test_exec_revoked_login_is_reported_without_raw_diagnostics(self):
+        with mock.patch.object(usage.subprocess,'Popen') as launch:
+            process=launch.return_value.__enter__.return_value
+            process.communicate.return_value=(None,b'refresh_token_invalidated sentinel-secret')
+            process.returncode=1
+            with self.assertRaisesRegex(usage.DeliveryError,'^agent_login_required$'):
+                usage.run_agent(self.root/'agent','READY',command='codex',readonly=True)
+
 
     def test_unrelated_second_header_is_still_a_conflict(self):
         records = journal()

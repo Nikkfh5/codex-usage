@@ -3,6 +3,7 @@ from decimal import Decimal
 import datetime as dt
 import json
 import math
+import re
 from pathlib import Path
 import time
 from urllib.parse import urlsplit
@@ -41,7 +42,7 @@ CONTRACT = {
 def apply_agent_rates(document, requested):
     """Validate the researched data before any observed event can use its rates."""
     checked = dt.date.fromisoformat(document['checked_on'])
-    if checked > dt.datetime.now(dt.timezone.utc).date():
+    if checked.isoformat() != document['checked_on'] or checked > dt.datetime.now(dt.timezone.utc).date():
         raise ValueError('future_rate_card')
     accepted = {}
     for item in document['models']:
@@ -49,7 +50,8 @@ def apply_agent_rates(document, requested):
         source = urlsplit(item['source'])
         if model not in requested or source.scheme != 'https' or source.hostname not in ('developers.openai.com','platform.openai.com') or source.username or source.password:
             raise ValueError('unverified_model_or_source')
-        if dt.date.fromisoformat(item['released_on']) > checked:
+        released = dt.date.fromisoformat(item['released_on'])
+        if released.isoformat() != item['released_on'] or released > checked:
             raise ValueError('unreleased_model')
         card = {}
         for tier in ('standard','fast','flex'):
@@ -98,11 +100,13 @@ def refresh_unknown_models(data_dir, models):
     if saved.exists():
         document = read_config(saved)
         apply_agent_rates(document,[c['model'] for c in document['models']])
-    unknown = sorted({m for m in models if isinstance(m,str) and m and ALIASES.get(m,m) not in RATES})
+    # Internal telemetry labels (e.g. codex-auto-review) are not public model IDs.
+    unknown = sorted({m for m in models if isinstance(m,str) and re.fullmatch(r'(gpt-[a-z0-9._-]+|o[0-9][a-z0-9._-]*|codex-mini-[a-z0-9._-]+)',m) and len(m)<=128 and ALIASES.get(m,m) not in RATES})
+    checkpoint = work / 'status.json'
     if not unknown:
         CONTRACT['automation'] = dict(status='idle',unknown_models=[])
+        write_config(checkpoint,CONTRACT['automation'])
         return
-    checkpoint = work / 'status.json'
     previous = read_config(checkpoint) if checkpoint.exists() else {}
     now = int(time.time()*1000)
     cooldown = 86400000 if previous.get('status') == 'unverified' and previous.get('unknown_models') == unknown else 3600000
@@ -139,8 +143,8 @@ long_threshold, long_input_multiplier, long_output_multiplier задавай т�
         # The file is data outside immutable releases; revaluation happens on read.
         write_config(saved,dict(checked_on=document['checked_on'],models=old+[c for c in document['models'] if c['model'] in accepted]))
         status['status'] = 'updated' if accepted else 'unverified'
-    except (OSError,ValueError,KeyError,TypeError,DeliveryError):
-        status['status'] = 'failed'
+    except (OSError,ValueError,KeyError,TypeError,DeliveryError) as exc:
+        status['status'] = 'needs_login' if isinstance(exc,DeliveryError) and str(exc)=='agent_login_required' else 'failed'
     write_config(checkpoint,status)
     CONTRACT['automation'] = status
 
