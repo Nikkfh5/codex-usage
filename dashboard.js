@@ -50,6 +50,7 @@ function activity(){
     const sync=document.createElement('span');sync.className='machine-signal';
     sync.textContent=m.journal?`${m.journal.age_ms==null?'Ожидается первый отчёт':'Сверка '+age(m.journal.age_ms)} · очередь в отчёте: ${number(m.journal.pending_events)} · сессий: ${number(m.journal.active_sessions)}${m.journal.mismatched_days?' · есть расхождения':''}${m.journal.last_error?' · '+m.journal.last_error:''}`:'OTLP · очередь и полнота не проверяются';
     b.append(sync);
+    if(m.journal){const repair=document.createElement('span');repair.className='machine-signal';const labels={idle:'ожидает ошибок',running:'разбирает ошибку',resolved:'ошибка устранена',unresolved:'нужна помощь',agent_failed:'не удалось запустить',start_failed:'не удалось запустить'};repair.textContent=m.journal.auto_repair?'Агент: '+(labels[m.journal.repair_status]||m.journal.repair_status):'Автоисправление: обновите отправитель';b.append(repair);}
     b.title=[m.host,m.client,m.version,'Цена и токены по текущим фильтрам'].filter(Boolean).join(' · ');b.onclick=()=>choose('machine',$('machine').value===m.machine?'':m.machine);
     const remove=document.createElement('button');remove.className='machine-remove';remove.textContent='×';remove.setAttribute('aria-label','Убрать карточку '+m.machine);remove.title='Убрать карточку. История сохранится.';remove.onclick=()=>visibility(m.machine,true,remove);
     card.append(b,remove);$('activity').append(card);
@@ -179,7 +180,8 @@ function themeLabel(){const dark=document.documentElement.dataset.theme==='dark'
 $('theme-toggle').onclick=()=>{document.documentElement.dataset.theme=document.documentElement.dataset.theme==='dark'?'light':'dark';try{localStorage.setItem('codex-usage-theme',document.documentElement.dataset.theme);}catch{}themeLabel();if(state){renderRankings();drawChart();}};themeLabel();
 $('pricing-open').onclick=async()=>{
   $('pricing-rates').textContent='Загрузка тарифов…';$('pricing-dialog').showModal();
-  try{if(!schema){const r=await fetch('/api/v1/schema');if(!r.ok)throw Error('Не удалось получить тарифы');schema=await r.json();}
+  try{const r=await fetch('/api/v1/schema');if(!r.ok)throw Error('Не удалось получить тарифы');schema=await r.json();
+    $('pricing-as-of').textContent=new Date(schema.pricing.as_of+'T00:00:00Z').toLocaleDateString('ru-RU',{day:'numeric',month:'long',year:'numeric',timeZone:'UTC'});
     $('pricing-rates').innerHTML='<table><thead><tr><th>Модель</th><th>Вход</th><th>Чтение кэша</th><th>Запись кэша</th><th>Выход</th></tr></thead><tbody>'+Object.entries(schema.pricing.rates_per_million).map(([model,card])=>'<tr><td>'+esc(model)+'</td>'+card.standard.map(v=>'<td>'+(v==null?'—':new Intl.NumberFormat('en-US',{style:'currency',currency:'USD',minimumFractionDigits:2,maximumFractionDigits:6}).format(v))+'</td>').join('')+'</tr>').join('')+'</tbody></table>';
   }catch(e){$('pricing-rates').textContent=e.message;}
 };

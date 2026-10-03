@@ -14,6 +14,7 @@ import os
 from pathlib import Path
 import plistlib
 import random
+import signal
 import shutil
 import sqlite3
 import subprocess
@@ -31,6 +32,54 @@ TOKEN_KEYS = ("input_tokens", "cached_input_tokens", "cache_write_input_tokens",
 TEXT_KEYS = ("response_id", "machine", "collector_id", "session", "model",
              "client_version", "effort", "service_tier")
 DEFAULT_BACKFILL_SINCE = "2026-09-05"
+
+
+def find_codex():
+    command = shutil.which("codex.exe") or shutil.which("codex")
+    if command and sys.platform == "win32" and Path(command).suffix.lower() in (".cmd", ".ps1"):
+        # npm's batch wrapper is unsuitable for a hidden subprocess without a shell.
+        root = Path(command).parent / "node_modules" / "@openai" / "codex"
+        command = next((str(p) for p in root.glob("**/bin/codex.exe")), None)
+    if not command:
+        raise DeliveryError("codex_cli_missing")
+    return command
+
+
+def run_agent(state_dir, prompt, *, command=None, readonly=False, schema=None):
+    """Run the local authenticated CLI; keep tools bounded and console output private."""
+    state_dir = Path(state_dir).resolve()
+    state_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    output = state_dir / "agent-last-message.txt"
+    output.unlink(missing_ok=True)
+    args = [command or find_codex(), "exec", "--skip-git-repo-check", "--ephemeral",
+            "--color", "never", "--sandbox", "read-only" if readonly else "workspace-write",
+            "-c", "approval_policy=\"never\"", "-c", "sandbox_workspace_write.network_access=true",
+            "-c", "web_search=\"live\"",
+            "-C", str(state_dir), "-o", str(output)]
+    if schema:
+        schema_path = state_dir / "agent-schema.json"
+        write_config(schema_path, schema)
+        args.extend(["--output-schema", str(schema_path)])
+    args.append("-")
+    options = dict(creationflags=subprocess.CREATE_NO_WINDOW) if sys.platform == "win32" else dict(start_new_session=True)
+    with subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, **options) as process:
+        try:
+            process.communicate(prompt.encode("utf-8"), timeout=300)
+        except subprocess.TimeoutExpired:
+            # Kill only this job's process tree, including a tool still running.
+            if sys.platform == "win32":
+                subprocess.run(["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                               capture_output=True, creationflags=subprocess.CREATE_NO_WINDOW)
+            else:
+                os.killpg(process.pid, signal.SIGKILL)
+            process.wait()
+            raise DeliveryError("agent_timeout")
+        if process.returncode:
+            raise DeliveryError("agent_failed")
+    if not output.exists():
+        raise DeliveryError("agent_output_missing")
+    os.chmod(output, 0o600)
+    return output.read_text(encoding="utf-8")
 
 
 def compact(value):
@@ -193,6 +242,8 @@ class Collector:
         result["incomplete_files"] = self.db.execute("SELECT count(*) FROM files WHERE eligible=1 AND complete=0").fetchone()[0]
         error = self.db.execute("SELECT error FROM files WHERE error IS NOT NULL ORDER BY path LIMIT 1").fetchone()
         result["last_error"] = self._get("delivery_error") or self._get("scan_error") or (error[0] if error else None)
+        result.update(auto_repair=bool(self.config.get("auto_repair")),
+                      repair_status=self._get("repair_status", "idle" if self.config.get("auto_repair") else "disabled"))
         runtime_error = self.state_dir / "runtime-error.txt"
         if runtime_error.exists():
             code = runtime_error.read_text(encoding="utf-8")
@@ -250,6 +301,9 @@ class Collector:
             self.db.execute("INSERT OR IGNORE INTO files(path) VALUES(?)", (key,))
             state = dict(self.db.execute("SELECT * FROM files WHERE path=?", (key,)).fetchone())
             context = json.loads(state["context"])
+            if state["error"] == "session_conflict" and "forked_from_id" not in context:
+                state.update(offset=0, prefix_hash="")
+                context = {}
             admitted = bool(context and self._eligible(context["session"], context["created_ms"]))
             if state["mtime_ns"] == stat.st_mtime_ns and state["size"] == stat.st_size and not state["error"] and (state["complete"] or not admitted) and bool(state["eligible"]) == admitted:
                 return
@@ -298,9 +352,16 @@ class Collector:
                             if not isinstance(session, str) or not session:
                                 raise ValueError("invalid_session")
                             if context and context["session"] != session:
-                                raise DeliveryError("session_conflict")
+                                # Forked subagents include their parent's header. It
+                                # does not change ownership of this child's journal.
+                                if session != context.get("forked_from_id"):
+                                    raise DeliveryError("session_conflict")
+                                digest.update(line)
+                                state["offset"] = stream.tell()
+                                continue
                             context = dict(session=session, created_ms=timestamp_ms(payload.get("timestamp", record.get("timestamp"))),
-                                           client_version=payload.get("cli_version"), model=None, effort=None, service_tier=None)
+                                           client_version=payload.get("cli_version"), forked_from_id=payload.get("forked_from_id"),
+                                           model=None, effort=None, service_tier=None)
                             state.update(session=session, eligible=int(self._eligible(session, context["created_ms"])))
                         elif not context:
                             raise DeliveryError("missing_session_meta")
@@ -403,7 +464,7 @@ class Collector:
                      digest=hashlib.sha256("".join(sorted(rows)).encode()).hexdigest())
                 for day, rows in sorted(grouped.items())]
         current = self.status()
-        result = self._post("inventory", days=days, status={k: current[k] for k in ("scanned_at_ms", "pending_events", "pending_tokens", "last_error")})
+        result = self._post("inventory", days=days, status={k: current[k] for k in ("scanned_at_ms", "pending_events", "pending_tokens", "last_error", "auto_repair", "repair_status")})
         if result.get("server_only_days"):
             raise DeliveryError("server_history_missing")
         resend = result.get("resend_days")
@@ -472,6 +533,61 @@ class Collector:
             result["last_error"] = result["last_error"] or result["backfill_error"]
         return result
 
+    def maybe_repair(self, result):
+        if not self.config.get("auto_repair"):
+            return
+        issue = result.get("last_error") or result.get("backfill_error")
+        with self.db:
+            if not issue:
+                self._set("repair_failures", 0)
+                self._set("repair_issue", "")
+                return
+            failures = int(self._get("repair_failures", 0)) + 1
+            self._set("repair_failures", failures)
+            # Three failed cycles skip transient errors. One job per unresolved
+            # issue, at most hourly across restarts, prevents a paid retry loop.
+            if failures < 3 or issue == self._get("repair_issue") or now_ms()-int(self._get("repair_started_ms", 0)) < 3600000:
+                return
+            self._set("repair_issue", issue)
+            self._set("repair_started_ms", now_ms())
+            self._set("repair_status", "running")
+        try:
+            options = dict(creationflags=subprocess.CREATE_NO_WINDOW) if sys.platform == "win32" else dict(start_new_session=True)
+            subprocess.Popen([sys.executable, str(Path(__file__).resolve()), "repair", "--state-dir", str(self.state_dir)],
+                             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, **options)
+        except OSError:
+            with self.db:
+                self._set("repair_status", "start_failed")
+
+
+def repair_worker(state_dir):
+    with contextlib.closing(Collector(read_config(Path(state_dir) / "config.json"), state_dir)) as collector:
+        config = collector.config
+        prompt = f"""Исправь доставку расхода Codex на этой машине. Участник разрешил автоматическое исправление.
+Рабочая область — только этот каталог отправителя. Прочитай codex_usage.py, doctor/status,
+backfill-report.json и таблицу files в ledger.sqlite. Исходные sessions/archived_sessions
+из {json.dumps(config['codex_home'])} можно читать, но запрещено изменять или удалять.
+Сохрани collector_id, machine, baseline_ms, владельцев сессий, историю и очередь.
+Не печатай секреты, переписку или сырые журналы. Не меняй другие приложения и не
+останавливай активные процессы Codex. Не обходи конфликты владельцев и не очищай ошибку
+без подтверждённого исправления. При переносе файла проверь session_meta.id и полный журнал.
+Проверь и догрузи подтверждённый расход с 2026-10-01T00:00:00+03:00 командой backfill
+сначала без --apply, затем с --apply. Ранее подключённая история должна сохраниться.
+Используй существующий ключ в config.json без вывода. Выполни once и doctor, проверь
+пустую очередь, серверную дневную сверку, исключения и повторное применение.
+Если исходные данные или доступ отсутствуют, сохрани их учёт и кратко укажи причину.
+Заверши за пять минут. Итог пиши по-русски, без секретов.
+Текущая ошибка: {json.dumps(collector.status()['last_error'])}."""
+        try:
+            run_agent(state_dir, prompt, command=config.get("codex_command"))
+            result = collector.once()
+            outcome = "unresolved" if result.get("last_error") or result.get("backfill_pending") else "resolved"
+        except (DeliveryError, OSError, ValueError, sqlite3.Error):
+            outcome = "agent_failed"
+        with collector.db:
+            collector._set("repair_status", outcome)
+        return collector.status()
+
 
 def read_config(path):
     with Path(path).open(encoding="utf-8") as stream:
@@ -490,9 +606,11 @@ def write_config(path, config):
 
 
 def history_cutoff(since):
-    if not isinstance(since, str) or dt.date.fromisoformat(since).isoformat() != since:
+    if not isinstance(since, str):
         raise ValueError("invalid_since")
-    since_ms = timestamp_ms(since + "T00:00:00Z")
+    if "T" not in since and dt.date.fromisoformat(since).isoformat() != since:
+        raise ValueError("invalid_since")
+    since_ms = timestamp_ms(since if "T" in since else since + "T00:00:00Z")
     if since_ms < 0:
         raise ValueError("invalid_since")
     return since_ms
@@ -578,7 +696,7 @@ def backfill(state_dir, since, apply=False, config=None):
                     reason = next((r["error"] for r in files if r["error"]), None)
                     if not reason and (not files or not all(r["complete"] for r in files)):
                         reason = "incomplete_journal"
-                    count, total = probe.db.execute("SELECT count(*),coalesce(sum(total_tokens),0) FROM events WHERE session=? AND day>=?", (session, since)).fetchone()
+                    count, total = probe.db.execute("SELECT count(*),coalesce(sum(total_tokens),0) FROM events WHERE session=? AND json_extract(data,'$.timestamp_ms')>=?", (session, since_ms)).fetchone()
                     if not reason and not total:
                         reason = "no_usage_in_window"
                     rows.append(dict(session=session, local_events=count, local_tokens=total,
@@ -682,7 +800,7 @@ def restore_install_history(state_dir, config):
 
 
 def install(state_dir, codex_home, machine=None, endpoint=None, token=None,
-            adopt_sessions=(), autostart=True, proxy=None, backfill_since=None):
+            adopt_sessions=(), autostart=True, proxy=None, backfill_since=None, auto_repair=None):
     import tomllib
     state_dir, codex_home = Path(state_dir).resolve(), Path(codex_home).resolve()
     state_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -709,6 +827,10 @@ def install(state_dir, codex_home, machine=None, endpoint=None, token=None,
                   backfill_since=backfill_since if backfill_since is not None else previous.get("backfill_since", DEFAULT_BACKFILL_SINCE),
                   adopt_sessions=sorted(set(previous.get("adopt_sessions", [])).union(adopt_sessions)),
                   proxy=proxy if proxy is not None else previous.get("proxy"), timeout=15)
+    if auto_repair is not None:
+        config["auto_repair"] = auto_repair
+    if config.get("auto_repair"):
+        config["codex_command"] = find_codex()
     if not config["machine"] or not config["endpoint"]:
         raise ValueError("machine_and_endpoint_required")
     if not config["token"]:
@@ -823,7 +945,7 @@ def main(argv=None):
     home = Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex")))
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
-    for command in ("install", "backfill", "run", "once", "status", "doctor"):
+    for command in ("install", "backfill", "run", "once", "status", "doctor", "repair"):
         sub = commands.add_parser(command)
         sub.add_argument("--state-dir", type=Path, default=home / "usage-sender")
         if command == "install":
@@ -832,7 +954,8 @@ def main(argv=None):
             sub.add_argument("--endpoint")
             sub.add_argument("--proxy")
             sub.add_argument("--adopt-session", action="append", default=[])
-            sub.add_argument("--backfill-since", help="history start date (default: saved date or 2026-09-05)")
+            sub.add_argument("--backfill-since", help="history date in UTC or ISO timestamp with timezone (default: saved date or 2026-09-05)")
+            sub.add_argument("--auto-repair", action=argparse.BooleanOptionalAction, default=None)
             sub.add_argument("--no-autostart", action="store_true")
         elif command == "backfill":
             sub.add_argument("--since", required=True)
@@ -847,9 +970,11 @@ def main(argv=None):
                 raise ValueError("client_requires_python_3_11")
             result = install(args.state_dir, args.codex_home, args.machine, args.endpoint,
                              adopt_sessions=args.adopt_session, autostart=not args.no_autostart, proxy=args.proxy,
-                             backfill_since=args.backfill_since)
+                             backfill_since=args.backfill_since, auto_repair=args.auto_repair)
         elif args.command == "backfill":
             result = backfill(args.state_dir, args.since, apply=args.apply)
+        elif args.command == "repair":
+            result = repair_worker(args.state_dir)
         else:
             collector = Collector(read_config(args.state_dir / "config.json"), args.state_dir)
             if args.command == "run":
@@ -866,6 +991,10 @@ def main(argv=None):
                             pass
                         if sys.stderr is not None:
                             print(json.dumps({"error": code}), file=sys.stderr, flush=True)
+                    try:
+                        collector.maybe_repair(result)
+                    except (sqlite3.Error, OSError, ValueError):
+                        pass  # A repair launch must not stop durable delivery.
                     delay = min(300, max(args.interval, delay * 2)) if result["last_error"] else max(1, args.interval)
                     time.sleep(delay + random.uniform(0, min(5, delay / 10)))
             elif args.command == "once":

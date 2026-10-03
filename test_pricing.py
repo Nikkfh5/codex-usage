@@ -5,6 +5,7 @@ import tempfile
 import unittest
 import urllib.request
 import urllib.error
+from unittest import mock
 from pathlib import Path
 
 import analytics
@@ -21,6 +22,32 @@ def priced(**changes):
 
 
 class PriceTests(unittest.TestCase):
+    def test_agent_rate_card_revalues_existing_unknown_events_and_rejects_unverified_source(self):
+        card=dict(model='new-official-model',source='https://developers.openai.com/api/docs/pricing',
+            released_on='2026-10-01',standard=[2,.1,2.5,10],fast=[4,.2,5,20],flex=None,
+            long_threshold=272000,long_input_multiplier=2,long_output_multiplier=1.5)
+        document=dict(checked_on='2026-10-03',models=[card])
+        raw=event(1,model=card['model'],cache_write_input_tokens=0,service_tier='default')
+        self.assertIsNone(analytics.enrich(raw)['api_cost_usd'])
+        with mock.patch.dict(pricing.RATES),mock.patch.dict(pricing.CONTRACT):
+            pricing.apply_agent_rates(document,[card['model']])
+            self.assertEqual(analytics.enrich(raw)['api_cost_usd'],.000248)
+        for changes in [{'source':'https://example.com/pricing'}, {'standard':[2,-.1,2.5,10]},
+                        {'model':'different-model'}, {'long_input_multiplier':None}]:
+            with self.subTest(changes=changes),self.assertRaises(ValueError):
+                pricing.apply_agent_rates({**document,'models':[{**card,**changes}]},[card['model']])
+
+    def test_new_sol_rates_since_release_and_long_context(self):
+        raw=event(1,model='gpt-6.1-sol',input_tokens=10000,cached_input_tokens=4000,
+            cache_write_input_tokens=2000,output_tokens=1000,service_tier='default')
+        for tier,factor in [('default',1),('priority',2),('flex',.5)]:
+            with self.subTest(tier=tier):
+                self.assertEqual(analytics.enrich({**raw,'service_tier':tier})['api_cost_usd'],.0234*factor)
+        long=analytics.enrich({**raw,'input_tokens':272001})
+        self.assertEqual(long['api_cost_usd'],(266001*4+4000*.2+2000*5+1000*15)/1e6)
+        self.assertEqual(analytics.enrich({**raw,'model':'gpt-6-sol'})['api_cost_usd'],.0238)
+        self.assertEqual(analytics.enrich({**raw,'model':'gpt-6-luna'})['api_cost_usd'],.00119)
+
     def test_cache_read_write_and_reasoning_without_double_charge(self):
         e=priced()
         # 4000*4 + 4000*.4 + 2000*5 + 1000*20 = 47600 USD / million.
