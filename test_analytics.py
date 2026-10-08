@@ -3,6 +3,7 @@ import sqlite3
 import tempfile
 import time
 import unittest
+from unittest.mock import patch
 import urllib.request
 import urllib.error
 import threading
@@ -11,6 +12,7 @@ from datetime import datetime, timezone
 from http.server import ThreadingHTTPServer
 
 import analytics
+import pricing
 from server import Store, Handler, normalize, records
 from test_server import batch
 
@@ -29,6 +31,25 @@ def fixture():
 
 
 class AnalyticsTests(unittest.TestCase):
+    def test_session_ranking_summarizes_only_the_displayed_top_100(self):
+        raw=[event(i,session=str(i),input_tokens=100+i,total_tokens=120+i) for i in range(130)]
+        with patch('analytics.summarize',wraps=analytics.summarize) as summarize:
+            d=analytics.report(raw,START,NOW,{},NOW,START,[])
+        self.assertEqual(d['session_count'],130)
+        self.assertEqual([s['key'] for s in d['sessions']],[str(i) for i in range(129,29,-1)])
+        self.assertEqual(sum(len(call.args[0])==1 for call in summarize.call_args_list),100)
+
+    def test_filtered_report_prices_only_selected_events_and_keeps_facets(self):
+        raw=fixture()+[event(-1000,effort=' HIGH ',service_tier=' PRIORITY ')]
+        with patch('pricing.estimate', wraps=analytics.pricing.estimate) as estimate:
+            d=analytics.report(raw,START,NOW,{'machine':'mac','effort':'high','tier':'fast'},NOW,START,[])
+        self.assertEqual(d['totals']['events'],2)
+        self.assertEqual(d['comparison']['totals']['events'],1)
+        self.assertEqual(d['facets']['machine'],['mac','server'])
+        self.assertEqual(d['facets']['effort'],['high','unknown'])
+        self.assertEqual(d['facets']['tier'],['fast','standard'])
+        self.assertEqual(estimate.call_count,3)
+
     def test_weighted_ratios_and_nonoverlapping_parts(self):
         t=analytics.summarize([analytics.enrich(e) for e in fixture()])
         self.assertEqual(t['total_tokens'],690)
@@ -47,6 +68,8 @@ class AnalyticsTests(unittest.TestCase):
         self.assertEqual(e['effort'],'unknown');self.assertEqual(e['tier'],'unknown')
         self.assertIsNone(analytics.summarize([])['total_tokens'])
         self.assertIsNone(analytics.ratio(0,0))
+        e.pop('cached_input_tokens')
+        self.assertIsNone(analytics.summarize([e])['cached_input_tokens'])
 
     def test_mode_changes_within_a_session_remain_per_response(self):
         raw=fixture()+[event(4000, effort='low', service_tier='default')]
@@ -103,6 +126,153 @@ class AnalyticsTests(unittest.TestCase):
 
 
 class PersistenceTests(unittest.TestCase):
+    def test_cached_window_reads_again_on_boundary_or_database_change(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path=Path(tmp)/'usage.sqlite'
+            store=Store(path)
+            queries=[]
+            def insert(connection,e):
+                connection.execute('INSERT INTO usage VALUES (?,?,?)',(e['id'],e['timestamp_ms'],json.dumps(e)))
+                connection.commit()
+            try:
+                insert(store.connection,event(1000))
+                insert(store.connection,event(86400001))
+                self.assertEqual(len(store.read_interval(START,NOW,cached=True)),1)
+                store.connection.set_trace_callback(queries.append)
+                self.assertEqual(len(store.read_interval(START+1,NOW+1,cached=True)),1)
+                self.assertFalse(any('FROM visible_usage' in q for q in queries))
+                self.assertEqual(len(store.read_interval(START+1001,NOW+2,cached=True)),1)
+                self.assertTrue(any('FROM visible_usage' in q for q in queries))
+                insert(store.connection,event(86400000))
+                self.assertEqual(len(store.read_interval(START+1001,NOW+2,cached=True)),2)
+                other=sqlite3.connect(path)
+                try:
+                    other.execute('DELETE FROM usage WHERE id=?',('86400000',));other.commit()
+                    self.assertEqual(len(store.read_interval(START+1001,NOW+2,cached=True)),1)
+                finally:
+                    other.close()
+            finally:
+                store.connection.close()
+
+    def test_cached_report_keeps_activity_coverage_and_bucket_size_live(self):
+        store=Store(':memory:')
+        params={'hours':['24']}
+        raw=event(86400000-1000)
+        try:
+            store.connection.execute('INSERT INTO usage VALUES (?,?,?)',(raw['id'],raw['timestamp_ms'],json.dumps(raw)))
+            store.connection.commit()
+            with patch('server.time.time',return_value=NOW/1000):
+                initial=store.analysis(params)
+            old=event(-3*86400000)
+            store.connection.execute('INSERT INTO usage VALUES (?,?,?)',(old['id'],old['timestamp_ms'],json.dumps(old)))
+            store.connection.execute('INSERT INTO machine_activity VALUES (?,?,?,?,?,?,?)',('idle-host',None,None,None,None,None,NOW))
+            store.connection.commit()
+            store.set_machine_visibility('idle-host',True)
+            with patch('analytics.grouped',side_effect=AssertionError('unchanged events were regrouped')):
+                with patch('server.time.time',return_value=(NOW+1)/1000):
+                    updated=store.analysis(params)
+            expected=analytics.report([raw],START+1,NOW+1,initial['filters'],NOW+1,old['timestamp_ms'],store.activity(NOW+1))
+            self.assertEqual(updated,expected)
+            self.assertTrue(updated['machine_activity'][0]['hidden'])
+            with patch('server.time.time',return_value=(NOW+1)/1000):
+                hourly=store.analysis({'hours':['1']})
+            self.assertEqual(hourly['period']['bucket_ms'],60000)
+            self.assertEqual(hourly['timeline'][0]['end_ms']-hourly['timeline'][0]['timestamp_ms'],60000)
+        finally:
+            store.connection.close()
+
+    def test_rolling_report_reuses_unchanged_events_and_groups(self):
+        store=Store(':memory:')
+        raw=[event(1000),event(2000,session='s2'),event(-1000)]
+        try:
+            for e in raw:
+                store.connection.execute('INSERT INTO usage VALUES (?,?,?)',(e['id'],e['timestamp_ms'],json.dumps(e)))
+            store.connection.commit()
+            with patch('server.time.time',return_value=NOW/1000):
+                store.analysis({'hours':['24']})
+            with patch('analytics.enrich',wraps=analytics.enrich) as enriched, patch('analytics.summarize',wraps=analytics.summarize) as summarized, patch('analytics.grouped',wraps=analytics.grouped) as grouped:
+                with patch('server.time.time',return_value=(NOW+1)/1000):
+                    warm=store.analysis({'hours':['24']})
+                self.assertEqual(enriched.call_count,0)
+                self.assertEqual(summarized.call_count,0)
+                self.assertEqual(grouped.call_count,0)
+            expected=analytics.report(raw,START+1,NOW+1,{'zero_output':'include','timezone':'UTC'},NOW+1,START-1000,[])
+            self.assertEqual(warm,expected)
+            added=event(3000,session='s2')
+            store.connection.execute('INSERT INTO usage VALUES (?,?,?)',(added['id'],added['timestamp_ms'],json.dumps(added)))
+            store.connection.commit()
+            with patch('analytics.enrich',wraps=analytics.enrich) as enriched, patch('analytics.summarize',wraps=analytics.summarize) as summarized:
+                with patch('server.time.time',return_value=(NOW+1)/1000):
+                    updated=store.analysis({'hours':['24']})
+                self.assertEqual(enriched.call_count,1)
+                self.assertFalse(any([e['id'] for e in call.args[0]]==['1000'] for call in summarized.call_args_list))
+            self.assertEqual(updated,analytics.report(raw+[added],START+1,NOW+1,expected['filters'],NOW+1,START-1000,[]))
+        finally:
+            store.connection.close()
+
+    def test_cached_report_tracks_boundaries_edits_deletes_and_rates(self):
+        store=Store(':memory:')
+        params={'hours':['24']}
+        raw=[event(0,model='gpt-5.5',service_tier='standard'),event(1000,model='gpt-5.5',service_tier='standard')]
+        def check(now):
+            with patch('server.time.time',return_value=now/1000):
+                actual=store.analysis(params)
+            start,end,filters=analytics.parse_query(params,now)
+            first=store.connection.execute('SELECT MIN(timestamp_ms) FROM visible_usage').fetchone()[0]
+            expected=analytics.report(store.read_interval(start-(end-start),end),start,end,filters,now,first,store.activity(now))
+            self.assertEqual(actual,expected)
+            return actual
+        try:
+            for e in raw:
+                store.connection.execute('INSERT INTO usage VALUES (?,?,?)',(e['id'],e['timestamp_ms'],json.dumps(e)))
+            store.connection.commit()
+            check(NOW)
+            crossed=check(NOW+1)
+            self.assertEqual(crossed['totals']['events'],1)
+            self.assertEqual(crossed['comparison']['totals']['events'],1)
+            changed={**raw[1],'input_tokens':200,'total_tokens':220}
+            store.connection.execute('UPDATE usage SET body=? WHERE id=?',(json.dumps(changed),changed['id']))
+            store.connection.commit()
+            edited=check(NOW+1)
+            self.assertEqual(edited['totals']['total_tokens'],220)
+            with patch.dict(pricing.RATES,{'gpt-5.5':{**pricing.RATES['gpt-5.5'],'standard':(10,1,None,60)}}):
+                repriced=check(NOW+1)
+                self.assertEqual(repriced['totals']['api_cost_usd'],2*edited['totals']['api_cost_usd'])
+            check(NOW+1)
+            long=event(86400001,model='gpt-5.5',input_tokens=300000,total_tokens=300020,service_tier='standard')
+            store.connection.execute('INSERT INTO usage VALUES (?,?,?)',(long['id'],long['timestamp_ms'],json.dumps(long)))
+            store.connection.commit()
+            self.assertGreater(check(NOW+1)['totals']['api_cost_usd'],edited['totals']['api_cost_usd'])
+            store.connection.execute('DELETE FROM usage WHERE id=?',(changed['id'],))
+            store.connection.commit()
+            self.assertEqual(check(NOW+1)['totals']['events'],0)
+        finally:
+            store.connection.close()
+
+    def test_analytics_reports_do_not_allocate_in_parallel(self):
+        store=Store(':memory:')
+        entered=threading.Event(); overlap=threading.Event(); release=threading.Event()
+        original=analytics.report
+        def report(*args, **kwargs):
+            if entered.is_set(): overlap.set()
+            entered.set()
+            release.wait(3)
+            return original(*args, **kwargs)
+        threads=[threading.Thread(target=store.analysis,args=({'start':[str(START)],'end':[str(NOW)]},)) for _ in range(2)]
+        try:
+            with patch('analytics.report',side_effect=report):
+                threads[0].start()
+                self.assertTrue(entered.wait(2))
+                threads[1].start()
+                try:
+                    self.assertFalse(overlap.wait(.2))
+                finally:
+                    release.set()
+                    for thread in threads: thread.join(3)
+                self.assertTrue(all(not thread.is_alive() for thread in threads))
+        finally:
+            store.connection.close()
+
     def test_metadata_does_not_change_retry_identity(self):
         one=next(records(batch()));two=next(records(batch(model_reasoning_effort='high',service_tier='fast')))
         a=normalize(*one);b=normalize(*two)
