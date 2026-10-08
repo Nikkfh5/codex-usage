@@ -3,6 +3,7 @@ from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from collections import defaultdict
 from math import fsum
+from operator import itemgetter
 import pricing
 
 VERSION = "2.2"
@@ -69,8 +70,11 @@ def ratio(numerator, denominator):
 def summarize(events):
     result = {"events": len(events), "sessions": len({(e["machine"], e["session"]) for e in events})}
     for key in METRICS:
-        values = [e.get(key) for e in events]
-        result[key] = sum(values) if values and all(v is not None for v in values) else None
+        try:
+            values = list(map(itemgetter(key), events))
+            result[key] = sum(values) if values and None not in values else None
+        except KeyError:
+            result[key] = None
     result.update(
         cache_total_pct=ratio(result["cached_input_tokens"], result["total_tokens"]),
         cache_input_pct=ratio(result["cached_input_tokens"], result["input_tokens"]),
@@ -84,11 +88,12 @@ def summarize(events):
         last_event_ms=max((e["timestamp_ms"] for e in events), default=None),
     )
     priced = [e for e in events if e.get("api_cost_usd") is not None]
+    known_costs = {key: round(fsum(map(itemgetter(key), priced)), 12) if priced else None for key in pricing.FIELDS}
     for key in pricing.FIELDS:
-        result[key] = round(fsum(e[key] for e in priced), 12) if events and len(priced) == len(events) else None
+        result[key] = known_costs[key] if events and len(priced) == len(events) else None
     result.update(
-        api_cost_known_usd=round(fsum(e["api_cost_usd"] for e in priced), 12) if priced else None,
-        api_cost_breakdown_known_usd={key: round(fsum(e[key] for e in priced), 12) if priced else None for key in pricing.PARTS},
+        api_cost_known_usd=known_costs["api_cost_usd"],
+        api_cost_breakdown_known_usd={key: known_costs[key] for key in pricing.PARTS},
         api_priced_events=len(priced), api_unpriced_events=len(events)-len(priced),
         api_assumed_tier_events=sum(e.get("api_price_assumed_tier", False) for e in priced),
         api_price_coverage_pct=ratio(len(priced), len(events)),
@@ -97,8 +102,18 @@ def summarize(events):
     return result
 
 
+def filter_value(event, key):
+    if key == "effort":
+        return label(event.get(key)) or "unknown"
+    if key == "tier":
+        return tier_name(event.get("service_tier"))
+    if key == "model":
+        return event.get(key) or "unknown"
+    return event.get(key)
+
+
 def matches(event, filters):
-    return all(not filters.get(k) or event.get(k) == filters[k] for k in FILTERS) and (filters.get("zero_output") != "exclude" or event["output_tokens"] > 0)
+    return all(not filters.get(k) or filter_value(event, k) == filters[k] for k in FILTERS) and (filters.get("zero_output") != "exclude" or event["output_tokens"] > 0)
 
 
 def parse_query(params, now_ms):
@@ -139,13 +154,16 @@ def parse_query(params, now_ms):
     return start, end, filters
 
 
-def grouped(events, key):
+def grouped(events, key, limit=None):
     groups = defaultdict(list)
     for e in events:
         value = (e["machine"], e["session"]) if key == "session" else e[key]
         groups[value].append(e)
     rows = []
-    for value, items in groups.items():
+    entries = groups.items()
+    if limit is not None:
+        entries = sorted(entries, key=lambda row: (-sum(e["total_tokens"] for e in row[1]), row[0][1] if key == "session" else row[0]))[:limit]
+    for value, items in entries:
         row = {"key": value[1] if key == "session" else value, **summarize(items)}
         if key == "session":
             row.update(machine=value[0], models=sorted({e["model"] for e in items}), efforts=sorted({e["effort"] for e in items}), tiers=sorted({e["tier"] for e in items}))
@@ -154,11 +172,10 @@ def grouped(events, key):
 
 
 def report(events, start, end, filters, now_ms, first_observed_ms, machine_activity):
-    all_events = [enrich(e) for e in events]
-    current_all = [e for e in all_events if start <= e["timestamp_ms"] < end]
-    current = [e for e in current_all if matches(e, filters)]
+    current_all = [e for e in events if start <= e["timestamp_ms"] < end]
+    current = [enrich(e) for e in current_all if matches(e, filters)]
     previous_start = start - (end - start)
-    previous = [e for e in all_events if previous_start <= e["timestamp_ms"] < start and matches(e, filters)]
+    previous = [enrich(e) for e in events if previous_start <= e["timestamp_ms"] < start and matches(e, filters)]
     totals, prior = summarize(current), summarize(previous)
     changes = {key: (round(100 * (totals[key] - prior[key]) / prior[key], 2) if totals[key] is not None and prior[key] not in (None, 0) else None) for key in (*METRICS, "api_cost_usd")}
     duration = end - start
@@ -179,7 +196,7 @@ def report(events, start, end, filters, now_ms, first_observed_ms, machine_activ
         return [{"timestamp_ms": t, "end_ms": ends[t], **summarize(rows), "machines": [{"key": row["key"], **{k: row[k] for k in (*METRICS, "api_cost_usd", "api_cost_known_usd")}} for row in grouped(rows, "machine")]} for t, rows in sorted(buckets.items())]
     timeline = timeline_for(current)
     # Facets deliberately ignore active filters: a selected empty slice stays selected.
-    facets = {key: sorted({e[key] for e in current_all}) for key in FILTERS if key != "session"}
+    facets = {key: sorted({filter_value(e, key) for e in current_all}) for key in FILTERS if key != "session"}
     facets["machine"] = sorted(set(facets["machine"]) | {m["machine"] for m in machine_activity})
     top = sorted(current, key=lambda e: (e["timestamp_ms"], e["id"]), reverse=True)[:20]
     return {
@@ -190,6 +207,6 @@ def report(events, start, end, filters, now_ms, first_observed_ms, machine_activ
         "coverage": {"first_observed_ms": first_observed_ms, "current_starts_before_first_observation": first_observed_ms is None or start < first_observed_ms, "previous_starts_before_first_observation": first_observed_ms is None or previous_start < first_observed_ms, "collection_completeness": "unknown", "effort_known_pct": ratio(totals["effort_known_events"], totals["events"]), "tier_known_pct": ratio(totals["tier_known_events"], totals["events"])},
         "timeline": timeline, "previous_timeline": timeline_for(previous),
         "breakdowns": {key: grouped(current, key) for key in ("machine", "model", "effort", "tier")},
-        "sessions": grouped(current, "session")[:100], "session_count": totals["sessions"],
+        "sessions": grouped(current, "session", limit=100), "session_count": totals["sessions"],
         "recent_events": top, "machine_activity": machine_activity,
     }

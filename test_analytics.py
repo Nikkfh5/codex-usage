@@ -3,6 +3,7 @@ import sqlite3
 import tempfile
 import time
 import unittest
+from unittest.mock import patch
 import urllib.request
 import urllib.error
 import threading
@@ -29,6 +30,25 @@ def fixture():
 
 
 class AnalyticsTests(unittest.TestCase):
+    def test_session_ranking_summarizes_only_the_displayed_top_100(self):
+        raw=[event(i,session=str(i),input_tokens=100+i,total_tokens=120+i) for i in range(130)]
+        with patch('analytics.summarize',wraps=analytics.summarize) as summarize:
+            d=analytics.report(raw,START,NOW,{},NOW,START,[])
+        self.assertEqual(d['session_count'],130)
+        self.assertEqual([s['key'] for s in d['sessions']],[str(i) for i in range(129,29,-1)])
+        self.assertEqual(sum(len(call.args[0])==1 for call in summarize.call_args_list),100)
+
+    def test_filtered_report_prices_only_selected_events_and_keeps_facets(self):
+        raw=fixture()+[event(-1000,effort=' HIGH ',service_tier=' PRIORITY ')]
+        with patch('pricing.estimate', wraps=analytics.pricing.estimate) as estimate:
+            d=analytics.report(raw,START,NOW,{'machine':'mac','effort':'high','tier':'fast'},NOW,START,[])
+        self.assertEqual(d['totals']['events'],2)
+        self.assertEqual(d['comparison']['totals']['events'],1)
+        self.assertEqual(d['facets']['machine'],['mac','server'])
+        self.assertEqual(d['facets']['effort'],['high','unknown'])
+        self.assertEqual(d['facets']['tier'],['fast','standard'])
+        self.assertEqual(estimate.call_count,3)
+
     def test_weighted_ratios_and_nonoverlapping_parts(self):
         t=analytics.summarize([analytics.enrich(e) for e in fixture()])
         self.assertEqual(t['total_tokens'],690)
@@ -47,6 +67,8 @@ class AnalyticsTests(unittest.TestCase):
         self.assertEqual(e['effort'],'unknown');self.assertEqual(e['tier'],'unknown')
         self.assertIsNone(analytics.summarize([])['total_tokens'])
         self.assertIsNone(analytics.ratio(0,0))
+        e.pop('cached_input_tokens')
+        self.assertIsNone(analytics.summarize([e])['cached_input_tokens'])
 
     def test_mode_changes_within_a_session_remain_per_response(self):
         raw=fixture()+[event(4000, effort='low', service_tier='default')]
@@ -103,6 +125,30 @@ class AnalyticsTests(unittest.TestCase):
 
 
 class PersistenceTests(unittest.TestCase):
+    def test_analytics_reports_do_not_allocate_in_parallel(self):
+        store=Store(':memory:')
+        entered=threading.Event(); overlap=threading.Event(); release=threading.Event()
+        original=analytics.report
+        def report(*args):
+            if entered.is_set(): overlap.set()
+            entered.set()
+            release.wait(3)
+            return original(*args)
+        threads=[threading.Thread(target=store.analysis,args=({'start':[str(START)],'end':[str(NOW)]},)) for _ in range(2)]
+        try:
+            with patch('analytics.report',side_effect=report):
+                threads[0].start()
+                self.assertTrue(entered.wait(2))
+                threads[1].start()
+                try:
+                    self.assertFalse(overlap.wait(.2))
+                finally:
+                    release.set()
+                    for thread in threads: thread.join(3)
+                self.assertTrue(all(not thread.is_alive() for thread in threads))
+        finally:
+            store.connection.close()
+
     def test_metadata_does_not_change_retry_identity(self):
         one=next(records(batch()));two=next(records(batch(model_reasoning_effort='high',service_tier='fast')))
         a=normalize(*one);b=normalize(*two)

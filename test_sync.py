@@ -3,6 +3,7 @@ import json
 import tempfile
 import threading
 import unittest
+from unittest.mock import patch
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -108,6 +109,31 @@ class SyncTests(unittest.TestCase):
     def test_untrusted_event_fields_are_discarded(self):
         self.store.sync(message("events", events=[{**event(), "prompt": "PRIVATE_SENTINEL"}]))
         self.assertNotIn("PRIVATE_SENTINEL", str(self.store.connection.execute("SELECT body FROM usage").fetchall()))
+
+    def test_repeated_inventory_does_not_revalidate_unchanged_history(self):
+        from codex_usage import canonical_event, day_inventory
+        raw = event("inventory-cache")
+        self.store.sync(message("events", events=[raw]))
+        payload = message("inventory", days=day_inventory([raw]),
+                          status=dict(scanned_at_ms=1788615089000, pending_events=0, pending_tokens=0, last_error=None))
+        self.assertEqual(self.store.sync(payload)["resend_days"], [])
+        with patch("codex_usage.canonical_event", wraps=canonical_event) as validate:
+            self.assertEqual(self.store.sync(payload)["resend_days"], [])
+        self.assertEqual(validate.call_count, 0)
+
+    def test_inventory_detects_changed_body_after_successful_check(self):
+        from codex_usage import day_inventory
+        raw = event("inventory-changed")
+        self.store.sync(message("events", events=[raw]))
+        payload = message("inventory", days=day_inventory([raw]),
+                          status=dict(scanned_at_ms=1788615089000, pending_events=0, pending_tokens=0, last_error=None))
+        self.assertEqual(self.store.sync(payload)["resend_days"], [])
+        key, body = self.store.connection.execute("SELECT id,body FROM usage").fetchone()
+        changed = json.loads(body)
+        changed.update(input_tokens=101, total_tokens=111)
+        self.store.connection.execute("UPDATE usage SET body=? WHERE id=?", (json.dumps(changed), key))
+        self.store.connection.commit()
+        self.assertEqual(self.store.sync(payload)["resend_days"], [payload["days"][0]["day"]])
 
     def test_first_upload_is_not_reported_as_an_empty_verified_queue(self):
         self.store.sync(message("events", events=[event()]))

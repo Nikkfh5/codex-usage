@@ -11,6 +11,7 @@ import sqlite3
 import threading
 import time
 from datetime import datetime
+from functools import lru_cache
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlsplit, parse_qs
@@ -19,11 +20,21 @@ import pricing
 
 ROOT = Path(__file__).resolve().parent
 LOCK = threading.Lock()
+ANALYSIS_LOCK = threading.RLock()
 TOKEN_FIELDS = {"input_tokens": "input_token_count", "output_tokens": "output_token_count", "cached_input_tokens": "cached_token_count", "reasoning_output_tokens": "reasoning_token_count", "cache_write_input_tokens": "cache_write_token_count", "tool_tokens": "tool_token_count"}
 SAFE = set(TOKEN_FIELDS.values()) | {"event.name", "event.kind", "event.timestamp", "env", "host.name", "model", "conversation.id", "service.name", "app.version", "originator", "startup.phase", "model_reasoning_effort", "reasoning_effort", "service_tier"}
 
 class SyncConflict(ValueError):
     pass
+
+
+@lru_cache(maxsize=100000)
+def inventory_row(body):
+    # Cache by the full stored body so changes and deleted rows still show up in reconciliation.
+    from codex_usage import canonical_event, compact
+    event = canonical_event(json.loads(body))
+    digest = hashlib.sha256(compact(event).encode("utf-8")).hexdigest()
+    return event["event_timestamp"][:10], event["response_id"] + ":" + digest + "\n"
 
 
 def sync_label(value):
@@ -159,7 +170,7 @@ class Store:
         return added
 
     def sync(self, payload):
-        from codex_usage import canonical_event, day_inventory, event_digest
+        from codex_usage import canonical_event, event_digest
         if not isinstance(payload, dict) or type(payload.get("version")) is not int or payload["version"] != 1:
             raise ValueError("unsupported protocol")
         machine, collector = sync_label(payload.get("machine")), sync_label(payload.get("collector_id"))
@@ -239,8 +250,12 @@ class Store:
                     if type(status['auto_repair']) is not bool or status.get('repair_status') not in ('disabled','idle','running','resolved','unresolved','agent_failed','start_failed','needs_login'):
                         raise ValueError('invalid_repair_status')
                     clean_status.update(auto_repair=status['auto_repair'],repair_status=status['repair_status'])
-                stored = [json.loads(row[0]) for row in self.connection.execute("SELECT body FROM usage WHERE json_extract(body,'$.collector_id')=? AND json_extract(body,'$.source')='journal'", (collector,))]
-                inventory = {day["day"]: day for day in day_inventory(stored)}
+                grouped = {}
+                for row in self.connection.execute("SELECT body FROM usage WHERE json_extract(body,'$.collector_id')=? AND json_extract(body,'$.source')='journal'", (collector,)):
+                    day, digest_row = inventory_row(row[0])
+                    grouped.setdefault(day, []).append(digest_row)
+                inventory = {day: dict(day=day, count=len(rows), digest=hashlib.sha256("".join(sorted(rows)).encode()).hexdigest())
+                             for day, rows in grouped.items()}
                 result["resend_days"] = sorted(day for day in reported if reported[day] != inventory.get(day))
                 # Missing client history is a visible disagreement, not proof of completeness.
                 result["server_only_days"] = sorted(set(inventory) - set(reported))
@@ -330,12 +345,14 @@ class Store:
         return result
 
     def analysis(self, params):
-        now = int(time.time() * 1000)
-        start, end, filters = analytics.parse_query(params, now)
-        events = self.read_interval(start - (end - start), end)
-        with LOCK:
-            first = self.connection.execute("SELECT MIN(timestamp_ms) FROM visible_usage").fetchone()[0]
-        return analytics.report(events, start, end, filters, now, first, self.activity(now))
+        # Bound peak memory: waiting requests must not each retain a full decoded interval.
+        with ANALYSIS_LOCK:
+            now = int(time.time() * 1000)
+            start, end, filters = analytics.parse_query(params, now)
+            events = self.read_interval(start - (end - start), end)
+            with LOCK:
+                first = self.connection.execute("SELECT MIN(timestamp_ms) FROM visible_usage").fetchone()[0]
+            return analytics.report(events, start, end, filters, now, first, self.activity(now))
 
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
@@ -408,6 +425,12 @@ class Handler(BaseHTTPRequestHandler):
         self.respond(200, json.dumps(result).encode())
 
     def do_GET(self):
+        if urlsplit(self.path).path in {"/api/v1/analytics", "/api/v1/events", "/api/v1/export.csv", "/api/usage"}:
+            with ANALYSIS_LOCK:
+                return self.get()
+        return self.get()
+
+    def get(self):
         if not self.valid_host():
             return self.respond(403, b'{}')
         path = urlsplit(self.path).path
