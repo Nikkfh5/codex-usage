@@ -63,7 +63,11 @@ class SyncTests(unittest.TestCase):
         self.store.ingest(batch())
         self.store.sync(message("events", events=[event(), event("resp-2")]))
         self.assertEqual(len(self.store.snapshot()["events"]), 1)
+        params={'start':[str(event()['timestamp_ms']-1000)],'end':[str(event()['timestamp_ms']+5000)]}
+        for _ in range(2):
+            self.assertEqual(self.store.analysis(params)['totals']['events'],1)
         self.store.sync(message("activate", sessions=["conversation-1"]))
+        self.assertEqual(self.store.analysis(params)['totals']['events'],2)
         events = self.store.read_interval(0, 2**53 - 1)
         self.assertEqual(len(events), 2)
         self.assertTrue(all(e["source"] == "journal" for e in events))

@@ -37,6 +37,13 @@ def inventory_row(body):
     return event["event_timestamp"][:10], event["response_id"] + ":" + digest + "\n"
 
 
+def stored_event(body, long_context):
+    event = json.loads(body)
+    if long_context:
+        event["api_session_long_context"] = True
+    return event
+
+
 def sync_label(value):
     if not isinstance(value, str) or not 0 < len(value) <= 240 or any(ord(c) < 32 for c in value):
         raise ValueError("invalid identity")
@@ -129,6 +136,21 @@ class Store:
             FROM usage GROUP BY json_extract(body, '$.machine')""")
         self.connection.commit()
         self.diagnostics = {"batches": 0, "records": 0, "duplicates": 0, "invalid_usage": 0, "schemas": {}, "last_received_ms": None}
+        self._event_cache = lru_cache(maxsize=100000)(stored_event)
+        self._enriched = {}
+        self._summaries = {}
+        self._rates = None
+        self._usage_version = 0
+        self._interval_cache = None
+        self.connection.create_function("usage_changed", 0, self.usage_changed)
+        # Connection-local triggers also detect maintenance writes through this connection.
+        # External writes are detected separately by SQLite's data_version.
+        for table in ("usage", "journal_sessions"):
+            for action in ("INSERT", "UPDATE", "DELETE"):
+                self.connection.execute(f"CREATE TEMP TRIGGER cache_{table}_{action} AFTER {action} ON {table} BEGIN SELECT usage_changed(); END")
+
+    def usage_changed(self):
+        self._usage_version += 1
 
     def ingest(self, payload):
         added = 0
@@ -295,17 +317,32 @@ class Store:
             return {"events": events, "diagnostics": json.loads(json.dumps(self.diagnostics)), "now_ms": int(time.time() * 1000)}
 
 
-    def read_interval(self, start, end):
+    def read_interval(self, start, end, cached=False):
         with LOCK:
-            events = [json.loads(row[0]) for row in self.connection.execute("SELECT body FROM visible_usage WHERE timestamp_ms >= ? AND timestamp_ms < ? ORDER BY timestamp_ms,id", (max(0, start), end))]
+            start = max(0, start)
+            version = (self._usage_version, self.connection.execute("PRAGMA data_version").fetchone()[0]) if cached else None
+            old = self._interval_cache
+            if cached and old is not None and old[0] == version and old[2] < start <= old[3] and old[4] < end <= old[5]:
+                return old[1]
             # GPT-5.5's documented long-context rate applies to its full session,
             # including when the long request falls outside the selected interval.
             long_sessions = set(self.connection.execute("""SELECT DISTINCT json_extract(body,'$.machine'), json_extract(body,'$.session') FROM visible_usage
                 WHERE json_extract(body,'$.model') IN ('gpt-5.5','gpt-5.5-2026-04-23') AND json_extract(body,'$.input_tokens') > 272000"""))
-        for event in events:
-            if (event["machine"], event["session"]) in long_sessions:
-                event["api_session_long_context"] = True
-        return events
+            decode = self._event_cache if cached else stored_event
+            events = []
+            first = last = None
+            for timestamp, body, machine, session in self.connection.execute("SELECT timestamp_ms,body,json_extract(body,'$.machine'),json_extract(body,'$.session') FROM visible_usage WHERE timestamp_ms >= ? AND timestamp_ms < ? ORDER BY timestamp_ms,id", (start, end)):
+                events.append(decode(body, (machine, session) in long_sessions))
+                first = timestamp if first is None else first
+                last = timestamp
+            if cached:
+                before = self.connection.execute("SELECT MAX(timestamp_ms) FROM visible_usage WHERE timestamp_ms < ?", (start,)).fetchone()[0]
+                after = self.connection.execute("SELECT MIN(timestamp_ms) FROM visible_usage WHERE timestamp_ms >= ?", (end,)).fetchone()[0]
+                lower = before if before is not None else -1
+                upper = after if after is not None else float("inf")
+                # Exact half-open membership remains unchanged only between adjacent events.
+                self._interval_cache = (version, events, lower, first if first is not None else upper, last if last is not None else lower, upper)
+            return events
 
     def set_machine_visibility(self, machine, hidden):
         with LOCK, self.connection:
@@ -349,10 +386,24 @@ class Store:
         with ANALYSIS_LOCK:
             now = int(time.time() * 1000)
             start, end, filters = analytics.parse_query(params, now)
-            events = self.read_interval(start - (end - start), end)
+            rates = json.dumps([pricing.RATES, pricing.ALIASES], sort_keys=True)
+            if rates != self._rates:
+                self._enriched.clear()
+                self._summaries.clear()
+                self._rates = rates
+            events = self.read_interval(start - (end - start), end, cached=True)
+            enriched = {}
+            def enrich(event):
+                old = self._enriched.get(event["id"])
+                value = old[1] if old is not None and old[0] is event else analytics.enrich(event)
+                enriched[event["id"]] = (event, value)
+                return value
             with LOCK:
                 first = self.connection.execute("SELECT MIN(timestamp_ms) FROM visible_usage").fetchone()[0]
-            return analytics.report(events, start, end, filters, now, first, self.activity(now))
+            result = analytics.report(events, start, end, filters, now, first, self.activity(now), enricher=enrich, cache=self._summaries)
+            if enriched:  # A complete report hit does not call the enricher.
+                self._enriched = enriched
+            return result
 
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
