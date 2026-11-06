@@ -117,6 +117,130 @@ class SenderTests(unittest.TestCase):
         path.write_text("".join(json.dumps(r) + "\n" for r in (records or journal())), encoding="utf-8")
         return path
 
+    def test_foreign_session_does_not_block_local_delivery_or_lose_history(self):
+        foreign = self.write(journal(session="foreign-session", response="foreign-response"), "foreign.jsonl")
+        local = self.write(journal())
+        self.state["event_statuses"] = [409]
+        self.state["ownership"] = {"foreign-session": dict(
+            machines=["other-machine"], collectors=["other-collector"],
+            active_machine="other-machine", active_collector="other-collector")}
+        result = self.sender.once()
+        self.assertEqual(result["pending_events"], 0)
+        self.assertEqual(result["blocked_events"], 1)
+        self.assertEqual(result["blocked_tokens"], 120)
+        self.assertEqual(result["last_error"], "foreign_session_owner")
+        self.assertEqual(set(self.state["events"]), {"resp-1"})
+        self.assertEqual(self.state["active"], {"session-new"})
+        self.assertEqual(self.sender.db.execute(
+            "SELECT acked FROM events WHERE response_id='foreign-response'").fetchone()[0], 0)
+        self.sender.close()
+        self.sender = self.make_sender()
+        with local.open("a") as stream:
+            stream.write(json.dumps(journal(response="resp-2")[-1]) + "\n")
+        with foreign.open("a") as stream:
+            stream.write(json.dumps(journal(session="foreign-session", response="foreign-2")[-1]) + "\n")
+        result = self.sender.once()
+        self.assertEqual(result["pending_events"], 0)
+        self.assertEqual(result["blocked_events"], 2)
+        self.assertEqual(set(self.state["events"]), {"resp-1", "resp-2"})
+        self.assertEqual(self.sender._inventory(), [])
+        self.assertEqual(sum(r["action"] == "inspect" for r in self.state["requests"]), 1)
+
+    def test_unexplained_conflict_preserves_the_pending_queue(self):
+        self.write()
+        self.state["action_status"] = {"events": 409}
+        result = self.sender.once()
+        self.assertEqual(result["last_error"], "HTTP_409")
+        self.assertEqual(result["pending_events"], 1)
+        self.assertEqual(result["blocked_events"], 0)
+
+    def test_verified_continuation_sends_only_its_scope_and_reconciles_after_restart(self):
+        records = journal(session="mixed", response="prefix")
+        records.append({**records[-1], "timestamp":"2026-09-17T00:00:02Z",
+                        "payload":{**records[-1]["payload"], "response_id":"continuation"}})
+        path = self.write(records)
+        self.sender.scan()
+        owner = dict(session="mixed", active_machine="other-machine", active_collector="other-collector")
+        with self.sender.db:
+            self.sender.db.execute("INSERT INTO blocked_sessions VALUES (?,?)", ("mixed",usage.compact(owner)))
+        self.assertEqual(self.sender.sync()["blocked_events"], 2)
+        owner["segments"] = [dict(start_ms=1789603202000,end_ms=1789603203000,
+                                  machine="test-machine",collector_id="collector-1")]
+        with self.sender.db:
+            self.sender.db.execute("UPDATE blocked_sessions SET ownership=? WHERE session='mixed'", (usage.compact(owner),))
+        before = self.sender.db.execute("SELECT response_id,digest,data FROM events ORDER BY response_id").fetchall()
+        result = self.sender.sync()
+        self.assertEqual((result["pending_events"],result["blocked_events"],result["blocked_tokens"]), (0,1,120))
+        self.assertEqual(set(self.state["events"]), {"continuation"})
+        self.assertEqual(self.state["active"], {"mixed"})
+        self.assertEqual(self.sender.db.execute("SELECT acked FROM events WHERE response_id='prefix'").fetchone()[0], 0)
+        self.assertEqual(self.sender.db.execute("SELECT response_id,digest,data FROM events ORDER BY response_id").fetchall(), before)
+        self.sender.close()
+        self.sender = self.make_sender()
+        self.state["events"].clear()
+        result = self.sender.once()
+        self.assertEqual(set(self.state["events"]), {"continuation"})
+        self.assertEqual(self.sender._inventory(), [])
+        with path.open("a") as stream:
+            stream.write(json.dumps({**records[-1],"timestamp":"2026-09-17T00:00:03Z",
+                                    "payload":{**records[-1]["payload"],"response_id":"outside"}})+"\n")
+        result = self.sender.once()
+        self.assertEqual((result["pending_events"],result["blocked_events"]), (0,2))
+        self.assertEqual(set(self.state["events"]), {"continuation"})
+
+    def test_continuation_grants_fail_closed_for_wrong_identity_or_invalid_bounds(self):
+        self.write()
+        self.sender.scan()
+        segment = dict(start_ms=1789603201000,end_ms=1789603202000,
+                       machine="test-machine",collector_id="collector-1")
+        for changes in (dict(machine="other"),dict(collector_id="other"),dict(start_ms=True),
+                        dict(end_ms="1789603202000"),dict(end_ms=1789603201000)):
+            owner = dict(segments=[{**segment,**changes}])
+            with self.sender.db:
+                self.sender.db.execute("INSERT OR REPLACE INTO blocked_sessions VALUES (?,?)",("session-new",usage.compact(owner)))
+            with self.subTest(changes=changes):
+                self.assertEqual(self.sender.status()["blocked_events"],1)
+                self.assertEqual(self.sender.db.execute("SELECT COUNT(*) FROM sendable_events").fetchone()[0],0)
+
+    def test_granted_response_conflict_is_not_retried_unchanged(self):
+        self.write()
+        self.state["event_statuses"] = [409,200]
+        self.state["ownership"] = {"session-new": dict(active_machine="other-machine",active_collector="other-collector",
+            segments=[dict(start_ms=1789603201000,end_ms=1789603202000,machine="test-machine",collector_id="collector-1")])}
+        result = self.sender.once()
+        self.assertEqual(result["last_error"],"HTTP_409")
+        self.assertEqual(result["pending_events"],1)
+        self.assertFalse(self.state["events"])
+
+    def test_missing_excluded_journal_does_not_report_delivery_failure(self):
+        old = self.write(journal(session="old-session", created="2026-09-01T00:00:00Z"), "old.jsonl")
+        self.write()
+        self.sender.once()
+        old.unlink()
+        result = self.sender.once()
+        self.assertIsNone(result["last_error"])
+        self.assertEqual(result["pending_events"], 0)
+        self.assertEqual(self.sender.db.execute(
+            "SELECT error FROM files WHERE session='old-session'").fetchone()[0], "file_missing")
+
+    def test_invalid_header_is_not_hidden_as_an_excluded_file(self):
+        self.write([dict(type="session_meta", payload={})])
+        self.assertEqual(self.sender.once()["last_error"], "parse_error")
+
+    def test_ownership_conflict_never_hides_acknowledged_history(self):
+        path = self.write()
+        self.sender.once()
+        with path.open("a") as stream:
+            stream.write(json.dumps(journal(response="resp-2")[-1]) + "\n")
+        self.state["action_status"] = {"events": 409}
+        self.state["ownership"] = {"session-new": dict(
+            active_machine="other-machine", active_collector="other-collector")}
+        result = self.sender.once()
+        self.assertEqual(result["last_error"], "HTTP_409")
+        self.assertEqual(result["pending_events"], 1)
+        self.assertEqual(result["blocked_events"], 0)
+        self.assertEqual(self.sender.db.execute("SELECT count(*) FROM events WHERE acked=1").fetchone()[0], 1)
+
     def test_canonical_validation_and_stable_daily_digest(self):
         record = usage.canonical_event(event(prompt="sentinel-secret"))
         self.assertNotIn("prompt", record)

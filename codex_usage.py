@@ -215,6 +215,20 @@ class Collector:
                 acked INTEGER NOT NULL DEFAULT 0);
             CREATE INDEX IF NOT EXISTS pending_events ON events(acked, response_id);
             CREATE INDEX IF NOT EXISTS session_events ON events(session, acked);
+            CREATE TABLE IF NOT EXISTS blocked_sessions(
+                session TEXT PRIMARY KEY, ownership TEXT NOT NULL);
+            CREATE TEMP VIEW sendable_events AS
+                SELECT e.* FROM events e LEFT JOIN blocked_sessions b ON b.session=e.session
+                WHERE e.acked=1 OR b.session IS NULL OR EXISTS (
+                    SELECT 1 FROM json_each(b.ownership,'$.segments') s
+                    WHERE json_extract(s.value,'$.machine')=json_extract(e.data,'$.machine')
+                    AND json_extract(s.value,'$.collector_id')=json_extract(e.data,'$.collector_id')
+                    AND json_type(s.value,'$.start_ms')='integer'
+                    AND json_type(s.value,'$.end_ms')='integer'
+                    AND json_extract(s.value,'$.start_ms')>=0
+                    AND json_extract(s.value,'$.end_ms')<=9007199254740991
+                    AND json_extract(e.data,'$.timestamp_ms')>=json_extract(s.value,'$.start_ms')
+                    AND json_extract(e.data,'$.timestamp_ms')<json_extract(s.value,'$.end_ms'));
         """)
         identity = compact({k: config[k] for k in ("machine", "collector_id", "baseline_ms")})
         previous = self._get("identity")
@@ -239,14 +253,18 @@ class Collector:
     def status(self):
         row = self.db.execute("SELECT count(*) ledger_events, coalesce(sum(CASE WHEN acked=0 THEN 1 ELSE 0 END),0) pending_events, coalesce(sum(CASE WHEN acked=0 THEN total_tokens ELSE 0 END),0) pending_tokens FROM events").fetchone()
         result = dict(row)
+        sendable = self.db.execute("SELECT count(*) pending_events, coalesce(sum(total_tokens),0) pending_tokens FROM sendable_events WHERE acked=0").fetchone()
+        result["blocked_events"] = result["pending_events"] - sendable["pending_events"]
+        result["blocked_tokens"] = result["pending_tokens"] - sendable["pending_tokens"]
+        result.update(sendable)
         result.update(machine=self.config["machine"], collector_id=self.config["collector_id"],
                       baseline_ms=self.config["baseline_ms"],
                       scanned_at_ms=int(self._get("scanned_at_ms", 0)),
                       synced_at_ms=int(self._get("synced_at_ms", 0)))
         result["excluded_files"] = self.db.execute("SELECT count(*) FROM files WHERE eligible=0 AND session IS NOT NULL").fetchone()[0]
         result["incomplete_files"] = self.db.execute("SELECT count(*) FROM files WHERE eligible=1 AND complete=0").fetchone()[0]
-        error = self.db.execute("SELECT error FROM files WHERE error IS NOT NULL ORDER BY path LIMIT 1").fetchone()
-        result["last_error"] = self._get("delivery_error") or self._get("scan_error") or (error[0] if error else None)
+        error = self.db.execute("SELECT error FROM files WHERE (eligible=1 OR session IS NULL) AND error IS NOT NULL ORDER BY path LIMIT 1").fetchone()
+        result["last_error"] = self._get("delivery_error") or self._get("scan_error") or (error[0] if error else None) or ("foreign_session_owner" if result["blocked_events"] else None)
         result.update(auto_repair=bool(self.config.get("auto_repair")),
                       repair_status=self._get("repair_status", "idle" if self.config.get("auto_repair") else "disabled"))
         runtime_error = self.state_dir / "runtime-error.txt"
@@ -450,10 +468,17 @@ class Collector:
 
     def _send_pending(self):
         while True:
-            rows = self.db.execute("SELECT response_id,data FROM events WHERE acked=0 ORDER BY response_id LIMIT 200").fetchall()
+            rows = self.db.execute("SELECT response_id,session,data FROM sendable_events WHERE acked=0 ORDER BY response_id LIMIT 200").fetchall()
             if not rows:
                 return
-            result = self._post("events", events=[json.loads(r["data"]) for r in rows])
+            try:
+                result = self._post("events", events=[json.loads(r["data"]) for r in rows])
+            except DeliveryError as exc:
+                if str(exc) != "HTTP_409" or not self._isolate_foreign_sessions({r["session"] for r in rows}):
+                    raise
+                if all(self.db.execute("SELECT 1 FROM sendable_events WHERE response_id=?", (r["response_id"],)).fetchone() for r in rows):
+                    raise  # A grant cannot explain a response conflict or justify an unchanged retry.
+                continue
             expected = {r["response_id"] for r in rows}
             accepted = result.get("accepted")
             if not isinstance(accepted, list) or any(not isinstance(v, str) for v in accepted) or set(accepted) != expected or len(accepted) != len(expected):
@@ -461,9 +486,30 @@ class Collector:
             with self.db:
                 self.db.executemany("UPDATE events SET acked=1 WHERE response_id=?", [(v,) for v in accepted])
 
+    def _isolate_foreign_sessions(self, sessions):
+        owners = self._post("inspect", sessions=sorted(sessions), since_ms=0).get("sessions")
+        if (not isinstance(owners, list) or len(owners) != len(sessions)
+                or any(not isinstance(owner, dict) or not isinstance(owner.get("session"), str) for owner in owners)
+                or {owner.get("session") for owner in owners} != sessions):
+            raise DeliveryError("invalid_inspection")
+        blocked = []
+        for owner in owners:
+            machine, collector = owner.get("active_machine"), owner.get("active_collector")
+            if not isinstance(machine, str) or not machine or not isinstance(collector, str) or not collector:
+                continue
+            if machine == self.config["machine"] and collector == self.config["collector_id"]:
+                continue
+            # Keep all responses for audit; never hide this collector's acknowledged history.
+            if self.db.execute("SELECT 1 FROM events WHERE session=? AND acked=1 LIMIT 1", (owner["session"],)).fetchone():
+                continue
+            blocked.append((owner["session"], compact(owner)))
+        with self.db:
+            self.db.executemany("INSERT OR IGNORE INTO blocked_sessions VALUES(?,?)", blocked)
+        return bool(blocked)
+
     def _inventory(self, mark_resend=True):
         grouped = {}
-        for day, response_id, digest in self.db.execute("SELECT day,response_id,digest FROM events"):
+        for day, response_id, digest in self.db.execute("SELECT day,response_id,digest FROM sendable_events"):
             grouped.setdefault(day, []).append(response_id + ":" + digest + "\n")
         days = [dict(day=day, count=len(rows),
                      digest=hashlib.sha256("".join(sorted(rows)).encode()).hexdigest())
@@ -478,7 +524,7 @@ class Collector:
             raise DeliveryError("invalid_inventory")
         if mark_resend:
             with self.db:
-                self.db.executemany("UPDATE events SET acked=0 WHERE day=?", [(d,) for d in resend])
+                self.db.executemany("UPDATE events SET acked=0 WHERE day=? AND response_id IN (SELECT response_id FROM sendable_events)", [(d,) for d in resend])
         return resend
 
     def sync(self):
@@ -491,8 +537,8 @@ class Collector:
                 sessions = [r[0] for r in self.db.execute("""
                     SELECT session FROM files WHERE eligible=1 GROUP BY session
                     HAVING min(complete)=1 AND max(error IS NOT NULL)=0
-                    AND EXISTS(SELECT 1 FROM events WHERE events.session=files.session)
-                    AND NOT EXISTS(SELECT 1 FROM events WHERE events.session=files.session AND acked=0)
+                    AND EXISTS(SELECT 1 FROM sendable_events WHERE sendable_events.session=files.session)
+                    AND NOT EXISTS(SELECT 1 FROM sendable_events WHERE sendable_events.session=files.session AND acked=0)
                 """)]
                 windows = {}
                 for session in sessions:
