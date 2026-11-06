@@ -3,6 +3,7 @@ import json
 import tempfile
 import threading
 import unittest
+from unittest.mock import patch
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -62,7 +63,11 @@ class SyncTests(unittest.TestCase):
         self.store.ingest(batch())
         self.store.sync(message("events", events=[event(), event("resp-2")]))
         self.assertEqual(len(self.store.snapshot()["events"]), 1)
+        params={'start':[str(event()['timestamp_ms']-1000)],'end':[str(event()['timestamp_ms']+5000)]}
+        for _ in range(2):
+            self.assertEqual(self.store.analysis(params)['totals']['events'],1)
         self.store.sync(message("activate", sessions=["conversation-1"]))
+        self.assertEqual(self.store.analysis(params)['totals']['events'],2)
         events = self.store.read_interval(0, 2**53 - 1)
         self.assertEqual(len(events), 2)
         self.assertTrue(all(e["source"] == "journal" for e in events))
@@ -88,6 +93,88 @@ class SyncTests(unittest.TestCase):
         self.assertEqual(self.store.snapshot()["events"][0]["machine"], "mac-a")
         self.assertEqual(self.store.connection.execute("SELECT COUNT(*) FROM usage").fetchone()[0], 2)
 
+    def test_explicit_continuation_preserves_prefix_and_rejects_copied_responses(self):
+        from codex_usage import canonical_event, day_inventory
+        self.store.ingest(batch())
+        self.store.sync(message("events", events=[event()]))
+        self.store.sync(message("activate", sessions=["conversation-1"]))
+        before = self.store.snapshot()["events"]
+        start = event()["timestamp_ms"] + 1000
+        continuation = {**event("resp-continuation"), "machine": "mac-b",
+                        "collector_id": "collector-b", "timestamp_ms": start}
+        payload = {**message("events", events=[continuation]), "machine": "mac-b", "collector_id": "collector-b"}
+        with self.assertRaisesRegex(ValueError, "ownership conflict"):
+            self.store.sync(payload)
+        # This grant is installed by an audited maintenance transaction, never by HTTP.
+        self.store.connection.execute("INSERT INTO journal_segments VALUES (?,?,?,?,?)",
+            ("conversation-1", start, start + 1000, "mac-b", "collector-b"))
+        self.store.connection.commit()
+        self.assertEqual(self.store.snapshot()["events"], before)
+        self.store.ingest(batch(env="mac-b", **{"event.timestamp": "2026-09-05T13:31:29.075Z"}))
+        # Unmatched foreign OTLP before the grant stays hidden and cannot become journal usage.
+        self.store.ingest(batch(env="mac-b", **{"event.timestamp": "2026-09-05T13:31:28.575Z"}))
+        self.store.sync(payload)
+        self.store.sync({**message("activate", sessions=["conversation-1"], since_ms=start), "machine":"mac-b", "collector_id":"collector-b"})
+        self.store.sync(message("activate", sessions=["conversation-1"]))
+        visible = self.store.snapshot()["events"]
+        self.assertEqual([(e["response_id"], e["machine"]) for e in visible], [("resp-1", "mac-a"), ("resp-continuation", "mac-b")])
+        self.assertEqual(self.store.connection.execute("SELECT COUNT(*) FROM usage").fetchone()[0], 5)
+        self.assertEqual(self.store.sync(payload)["accepted"], ["resp-continuation"])
+        status = dict(scanned_at_ms=start, pending_events=0, pending_tokens=0, last_error=None)
+        result = self.store.sync({**payload, "action":"inventory", "days":day_inventory([canonical_event(continuation)]), "status":status})
+        self.assertEqual((result["resend_days"], result["server_only_days"]), ([], []))
+        for changed in ({**continuation, "response_id":"resp-1"},
+                        {**continuation, "response_id":"before", "timestamp_ms":start-1},
+                        {**continuation, "response_id":"after", "timestamp_ms":start+1000},
+                        {**continuation, "machine":"mac-a", "collector_id":"collector-a"}):
+            with self.assertRaisesRegex(ValueError, "conflict"):
+                self.store.sync({**message("events",events=[changed]), "machine":changed["machine"], "collector_id":changed["collector_id"]})
+        self.assertEqual(self.store.snapshot()["events"], visible)
+
+    def test_continuation_inspection_is_read_only_and_survives_restart(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory)/"usage.sqlite"
+            store = Store(path)
+            start = event()["timestamp_ms"]
+            try:
+                store.connection.execute("INSERT INTO journal_segments VALUES (?,?,?,?,?)", ("conversation-1",start,start+1000,"mac-a","collector-a"))
+                store.connection.commit()
+            finally:
+                store.connection.close()
+            store = Store(path)
+            try:
+                before = list(store.connection.iterdump())
+                result = store.sync(message("inspect", sessions=["conversation-1"]))["sessions"][0]
+                self.assertEqual(result["segments"], [dict(start_ms=start,end_ms=start+1000,machine="mac-a",collector_id="collector-a")])
+                self.assertEqual(list(store.connection.iterdump()), before)
+            finally:
+                store.connection.close()
+
+    def test_segment_boundaries_overlap_and_cached_visibility(self):
+        import sqlite3
+        from unittest.mock import patch
+        self.store.sync(message("events", events=[event()]))
+        self.store.sync(message("activate", sessions=["conversation-1"]))
+        start = event()["timestamp_ms"]
+        params = {"start":[str(start)], "end":[str(start+1000)]}
+        with patch("server.time.time",return_value=(start+1000)/1000):
+            before = self.store.analysis(params)
+            self.store.connection.execute("INSERT INTO journal_segments VALUES (?,?,?,?,?)", ("conversation-1",start,start+1000,"mac-b","collector-b"))
+            self.store.connection.commit()
+            self.assertNotEqual(self.store.analysis(params)["totals"], before["totals"])
+            self.store.connection.execute("DELETE FROM journal_segments")
+            self.store.connection.commit()
+            self.assertEqual(self.store.analysis(params)["totals"], before["totals"])
+        self.store.connection.execute("INSERT INTO journal_segments VALUES (?,?,?,?,?)", ("conversation-1",start,start+1000,"mac-b","collector-b"))
+        self.store.connection.commit()
+        for lo,hi in ((start,start),(-1,start),(start+500,start+2000)):
+            with self.subTest(lo=lo,hi=hi), self.assertRaises(sqlite3.IntegrityError):
+                with self.store.connection:
+                    self.store.connection.execute("INSERT INTO journal_segments VALUES (?,?,?,?,?)", ("conversation-1",lo,hi,"mac-b","collector-b"))
+        with self.assertRaises(sqlite3.IntegrityError), self.store.connection:
+            self.store.connection.execute("INSERT INTO journal_segments VALUES (?,?,?,?,?)", ("conversation-1",start+1000,start+2000,"mac-b","collector-b"))
+            self.store.connection.execute("UPDATE journal_segments SET start_ms=? WHERE start_ms=?", (start+999,start+1000))
+
     def test_inventory_finds_server_loss_and_status_survives_restart(self):
         from codex_usage import canonical_event, day_inventory
         days = day_inventory([canonical_event(event())])
@@ -108,6 +195,31 @@ class SyncTests(unittest.TestCase):
     def test_untrusted_event_fields_are_discarded(self):
         self.store.sync(message("events", events=[{**event(), "prompt": "PRIVATE_SENTINEL"}]))
         self.assertNotIn("PRIVATE_SENTINEL", str(self.store.connection.execute("SELECT body FROM usage").fetchall()))
+
+    def test_repeated_inventory_does_not_revalidate_unchanged_history(self):
+        from codex_usage import canonical_event, day_inventory
+        raw = event("inventory-cache")
+        self.store.sync(message("events", events=[raw]))
+        payload = message("inventory", days=day_inventory([raw]),
+                          status=dict(scanned_at_ms=1788615089000, pending_events=0, pending_tokens=0, last_error=None))
+        self.assertEqual(self.store.sync(payload)["resend_days"], [])
+        with patch("codex_usage.canonical_event", wraps=canonical_event) as validate:
+            self.assertEqual(self.store.sync(payload)["resend_days"], [])
+        self.assertEqual(validate.call_count, 0)
+
+    def test_inventory_detects_changed_body_after_successful_check(self):
+        from codex_usage import day_inventory
+        raw = event("inventory-changed")
+        self.store.sync(message("events", events=[raw]))
+        payload = message("inventory", days=day_inventory([raw]),
+                          status=dict(scanned_at_ms=1788615089000, pending_events=0, pending_tokens=0, last_error=None))
+        self.assertEqual(self.store.sync(payload)["resend_days"], [])
+        key, body = self.store.connection.execute("SELECT id,body FROM usage").fetchone()
+        changed = json.loads(body)
+        changed.update(input_tokens=101, total_tokens=111)
+        self.store.connection.execute("UPDATE usage SET body=? WHERE id=?", (json.dumps(changed), key))
+        self.store.connection.commit()
+        self.assertEqual(self.store.sync(payload)["resend_days"], [payload["days"][0]["day"]])
 
     def test_first_upload_is_not_reported_as_an_empty_verified_queue(self):
         self.store.sync(message("events", events=[event()]))

@@ -214,6 +214,7 @@ class Collector:
                 digest TEXT NOT NULL, data TEXT NOT NULL, total_tokens INTEGER NOT NULL,
                 acked INTEGER NOT NULL DEFAULT 0);
             CREATE INDEX IF NOT EXISTS pending_events ON events(acked, response_id);
+            CREATE INDEX IF NOT EXISTS session_events ON events(session, acked);
         """)
         identity = compact({k: config[k] for k in ("machine", "collector_id", "baseline_ms")})
         previous = self._get("identity")
