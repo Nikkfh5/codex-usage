@@ -123,12 +123,29 @@ class Store:
         self.connection.execute("CREATE TABLE IF NOT EXISTS machine_preferences (machine TEXT PRIMARY KEY, hidden INTEGER NOT NULL CHECK(hidden IN (0,1)))")
         self.connection.execute("CREATE TABLE IF NOT EXISTS journal_collectors (collector_id TEXT PRIMARY KEY, machine TEXT NOT NULL, received_ms INTEGER NOT NULL, status TEXT NOT NULL)")
         self.connection.execute("CREATE TABLE IF NOT EXISTS journal_sessions (session TEXT PRIMARY KEY, machine TEXT NOT NULL, collector_id TEXT NOT NULL)")
-        # Original OTLP rows remain available for audit; choose one source for each whole session.
-        self.connection.execute("""CREATE VIEW IF NOT EXISTS visible_usage AS
+        # Explicit, audited continuation grants; the ingest API cannot create or widen them.
+        self.connection.execute("""CREATE TABLE IF NOT EXISTS journal_segments (
+            session TEXT NOT NULL, start_ms INTEGER NOT NULL CHECK(start_ms>=0),
+            end_ms INTEGER NOT NULL CHECK(end_ms>start_ms AND end_ms<=9007199254740991),
+            machine TEXT NOT NULL, collector_id TEXT NOT NULL, PRIMARY KEY(session,start_ms))""")
+        for action in ("INSERT", "UPDATE"):
+            exclude = " AND rowid!=OLD.rowid" if action == "UPDATE" else ""
+            self.connection.execute(f"""CREATE TRIGGER IF NOT EXISTS journal_segments_{action.lower()}
+                BEFORE {action} ON journal_segments WHEN EXISTS (
+                    SELECT 1 FROM journal_segments WHERE session=NEW.session
+                    AND start_ms<NEW.end_ms AND end_ms>NEW.start_ms{exclude})
+                BEGIN SELECT RAISE(ABORT,'overlapping journal segments'); END""")
+        # Original rows and whole-session owners remain intact. A grant overrides only its interval.
+        self.connection.execute("DROP VIEW IF EXISTS visible_usage")
+        self.connection.execute("""CREATE VIEW visible_usage AS
             SELECT u.* FROM usage u LEFT JOIN journal_sessions j
               ON j.session=json_extract(u.body,'$.session')
-            WHERE (json_extract(u.body,'$.source')='journal' AND j.collector_id=json_extract(u.body,'$.collector_id') AND j.machine=json_extract(u.body,'$.machine'))
-               OR (COALESCE(json_extract(u.body,'$.source'),'otlp')!='journal' AND j.session IS NULL)""")
+            LEFT JOIN journal_segments s ON s.session=json_extract(u.body,'$.session')
+              AND u.timestamp_ms>=s.start_ms AND u.timestamp_ms<s.end_ms
+            WHERE (json_extract(u.body,'$.source')='journal'
+                AND COALESCE(s.collector_id,j.collector_id)=json_extract(u.body,'$.collector_id')
+                AND COALESCE(s.machine,j.machine)=json_extract(u.body,'$.machine'))
+               OR (COALESCE(json_extract(u.body,'$.source'),'otlp')!='journal' AND j.session IS NULL AND s.session IS NULL)""")
         # Legacy usage remains untouched. Its event timestamp is not a receipt timestamp.
         self.connection.execute("""INSERT OR IGNORE INTO machine_activity
             SELECT json_extract(body, '$.machine'), MAX(json_extract(body, '$.host')),
@@ -145,12 +162,16 @@ class Store:
         self.connection.create_function("usage_changed", 0, self.usage_changed)
         # Connection-local triggers also detect maintenance writes through this connection.
         # External writes are detected separately by SQLite's data_version.
-        for table in ("usage", "journal_sessions"):
+        for table in ("usage", "journal_sessions", "journal_segments"):
             for action in ("INSERT", "UPDATE", "DELETE"):
                 self.connection.execute(f"CREATE TEMP TRIGGER cache_{table}_{action} AFTER {action} ON {table} BEGIN SELECT usage_changed(); END")
 
     def usage_changed(self):
         self._usage_version += 1
+
+    def journal_owner(self, session, timestamp_ms):
+        segment = self.connection.execute("SELECT machine,collector_id FROM journal_segments WHERE session=? AND start_ms<=? AND end_ms>?", (session,timestamp_ms,timestamp_ms)).fetchone()
+        return segment or self.connection.execute("SELECT machine,collector_id FROM journal_sessions WHERE session=?", (session,)).fetchone()
 
     def ingest(self, payload):
         added = 0
@@ -225,6 +246,9 @@ class Store:
                         active_collector=active[1] if active else None,
                         before_since=any(row["timestamp_ms"] < since for row in rows),
                         events=visible[0], total_tokens=visible[1]))
+                    segments = self.connection.execute("SELECT start_ms,end_ms,machine,collector_id FROM journal_segments WHERE session=? ORDER BY start_ms", (session,)).fetchall()
+                    if segments:
+                        result["sessions"][-1]["segments"] = [dict(zip(("start_ms","end_ms","machine","collector_id"), row)) for row in segments]
                 return result  # Read-only: inspection must not register a collector or refresh activity.
             self.connection.execute("INSERT INTO journal_collectors VALUES (?,?,?,?) ON CONFLICT(collector_id) DO UPDATE SET received_ms=excluded.received_ms", (collector, machine, now, '{}'))
             if action == "events":
@@ -236,8 +260,8 @@ class Store:
                     item = canonical_event(raw)
                     if item["machine"] != machine or item["collector_id"] != collector:
                         raise SyncConflict("event identity conflict")
-                    active = self.connection.execute("SELECT collector_id FROM journal_sessions WHERE session=?", (item["session"],)).fetchone()
-                    if active and active[0] != collector:
+                    active = self.journal_owner(item["session"], item["timestamp_ms"])
+                    if active and active != (machine, collector):
                         raise SyncConflict("session ownership conflict")
                     previous = self.connection.execute("SELECT body FROM usage WHERE id=?", (item["id"],)).fetchone()
                     if previous and event_digest(json.loads(previous[0])) != event_digest(item):
@@ -287,6 +311,17 @@ class Store:
             elif action == "activate":
                 for session in sessions:
                     rows = [json.loads(row[0]) for row in self.connection.execute("SELECT body FROM usage WHERE json_extract(body,'$.session')=?", (session,))]
+                    previous = self.connection.execute("SELECT machine,collector_id FROM journal_sessions WHERE session=?", (session,)).fetchone()
+                    segments = self.connection.execute("SELECT start_ms,end_ms,machine,collector_id FROM journal_segments WHERE session=?", (session,)).fetchall()
+                    own_segments = [s for s in segments if s[2:] == (machine,collector)]
+                    if previous and previous != (machine,collector) and not own_segments:
+                        raise SyncConflict("session ownership conflict")
+                    # Activation checks only the caller's approved scope; imported prefixes still conflict.
+                    if segments:
+                        rows = [row for row in rows if any(s[0]<=row["timestamp_ms"]<s[1] for s in own_segments)
+                                or (not any(s[0]<=row["timestamp_ms"]<s[1] for s in segments) and
+                                    (not previous or previous == (machine,collector)) and
+                                    (row["machine"]==machine or row.get("source")=="journal" or not previous))]
                     own = [row for row in rows if row.get("source") == "journal" and row.get("collector_id") == collector]
                     if not own:
                         raise ValueError("session has no journal records")
@@ -294,14 +329,12 @@ class Store:
                         raise SyncConflict("session history conflict")
                     if any(row["timestamp_ms"] < since for row in rows):
                         raise SyncConflict("session history predates cutoff")
-                    previous = self.connection.execute("SELECT collector_id FROM journal_sessions WHERE session=?", (session,)).fetchone()
-                    if previous and previous[0] != collector:
-                        raise SyncConflict("session ownership conflict")
-                    self.connection.execute("INSERT OR IGNORE INTO journal_sessions VALUES (?,?,?)", (session, machine, collector))
+                    if not own_segments or previous == (machine,collector):
+                        self.connection.execute("INSERT OR IGNORE INTO journal_sessions VALUES (?,?,?)", (session, machine, collector))
                 result["activated"] = sessions
             else:
                 raise ValueError("unknown action")
-            result["active_sessions"] = [row[0] for row in self.connection.execute("SELECT session FROM journal_sessions WHERE collector_id=? ORDER BY session", (collector,))]
+            result["active_sessions"] = [row[0] for row in self.connection.execute("SELECT session FROM journal_sessions WHERE collector_id=? UNION SELECT session FROM journal_segments WHERE collector_id=? ORDER BY session", (collector,collector))]
             self.connection.execute("""INSERT INTO machine_activity VALUES (?,?,?,?,NULL,NULL,?)
                 ON CONFLICT(machine) DO UPDATE SET last_received_ms=excluded.last_received_ms""", (machine, machine, "codex_journal", None, now))
         # The connection context has committed before ACK reaches the HTTP handler.
@@ -363,7 +396,7 @@ class Store:
             rows = self.connection.execute("SELECT * FROM machine_activity ORDER BY machine").fetchall()
             hidden = {row[0] for row in self.connection.execute("SELECT machine FROM machine_preferences WHERE hidden=1")}
             collectors = self.connection.execute("SELECT collector_id,machine,received_ms,status FROM journal_collectors ORDER BY received_ms").fetchall()
-            active_counts = dict(self.connection.execute("SELECT collector_id,COUNT(*) FROM journal_sessions GROUP BY collector_id"))
+            active_counts = dict(self.connection.execute("SELECT collector_id,COUNT(*) FROM (SELECT collector_id,session FROM journal_sessions UNION SELECT collector_id,session FROM journal_segments) GROUP BY collector_id"))
         journal = {}
         for collector, machine, received, status in collectors:
             report = json.loads(status)
