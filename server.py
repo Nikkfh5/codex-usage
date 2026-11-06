@@ -136,7 +136,7 @@ class Store:
             FROM usage GROUP BY json_extract(body, '$.machine')""")
         self.connection.commit()
         self.diagnostics = {"batches": 0, "records": 0, "duplicates": 0, "invalid_usage": 0, "schemas": {}, "last_received_ms": None}
-        self._event_cache = lru_cache(maxsize=100000)(stored_event)
+        self._event_cache = {}
         self._enriched = {}
         self._summaries = {}
         self._rates = None
@@ -328,11 +328,17 @@ class Store:
             # including when the long request falls outside the selected interval.
             long_sessions = set(self.connection.execute("""SELECT DISTINCT json_extract(body,'$.machine'), json_extract(body,'$.session') FROM visible_usage
                 WHERE json_extract(body,'$.model') IN ('gpt-5.5','gpt-5.5-2026-04-23') AND json_extract(body,'$.input_tokens') > 272000"""))
-            decode = self._event_cache if cached else stored_event
+            decoded = {}
             events = []
             first = last = None
             for timestamp, body, machine, session in self.connection.execute("SELECT timestamp_ms,body,json_extract(body,'$.machine'),json_extract(body,'$.session') FROM visible_usage WHERE timestamp_ms >= ? AND timestamp_ms < ? ORDER BY timestamp_ms,id", (start, end)):
-                events.append(decode(body, (machine, session) in long_sessions))
+                key = (body, (machine, session) in long_sessions)
+                event = self._event_cache.get(key) if cached else None
+                if event is None:
+                    event = stored_event(*key)
+                if cached:
+                    decoded[key] = event
+                events.append(event)
                 first = timestamp if first is None else first
                 last = timestamp
             if cached:
@@ -341,6 +347,7 @@ class Store:
                 lower = before if before is not None else -1
                 upper = after if after is not None else float("inf")
                 # Exact half-open membership remains unchanged only between adjacent events.
+                self._event_cache = decoded
                 self._interval_cache = (version, events, lower, first if first is not None else upper, last if last is not None else lower, upper)
             return events
 

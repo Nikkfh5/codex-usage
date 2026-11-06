@@ -3,6 +3,7 @@ import sqlite3
 import tempfile
 import time
 import unittest
+from functools import lru_cache
 from unittest.mock import patch
 import urllib.request
 import urllib.error
@@ -207,6 +208,30 @@ class PersistenceTests(unittest.TestCase):
                 self.assertEqual(enriched.call_count,1)
                 self.assertFalse(any([e['id'] for e in call.args[0]]==['1000'] for call in summarized.call_args_list))
             self.assertEqual(updated,analytics.report(raw+[added],START+1,NOW+1,expected['filters'],NOW+1,START-1000,[]))
+        finally:
+            store.connection.close()
+
+    def test_rolling_report_reuses_events_beyond_decode_cache_capacity(self):
+        with patch('server.lru_cache', return_value=lru_cache(maxsize=2)):
+            store=Store(':memory:')
+        raw=[event(i) for i in range(1,5)]
+        try:
+            for e in raw:
+                store.connection.execute('INSERT INTO usage VALUES (?,?,?)',(e['id'],e['timestamp_ms'],json.dumps(e)))
+            store.connection.commit()
+            with patch('server.time.time',return_value=NOW/1000):
+                initial=store.analysis({'hours':['24']})
+            added=event(5)
+            store.connection.execute('INSERT INTO usage VALUES (?,?,?)',(added['id'],added['timestamp_ms'],json.dumps(added)))
+            store.connection.commit()
+            with patch('analytics.enrich',wraps=analytics.enrich) as enriched:
+                with patch('server.time.time',return_value=(NOW+1)/1000):
+                    actual=store.analysis({'hours':['24']})
+                self.assertEqual(enriched.call_count,1)
+            expected=analytics.report(raw+[added],START+1,NOW+1,initial['filters'],NOW+1,START+1,[])
+            self.assertEqual(actual,expected)
+            store.read_interval(NOW-1000,NOW,cached=True)
+            self.assertFalse(store._event_cache)
         finally:
             store.connection.close()
 
